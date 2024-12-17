@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/gradientzero/comby-store-postgres/internal"
 	"github.com/gradientzero/comby/v2"
-	combyStore "github.com/gradientzero/comby/v2/store"
 	_ "github.com/lib/pq"
 )
 
@@ -140,7 +140,7 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 	}
 
 	// sql statement
-	dbRecord, err := combyStore.BaseEventToDbEvent(evt)
+	dbRecord, err := internal.BaseEventToDbEvent(evt)
 	if err != nil {
 		return err
 	}
@@ -218,7 +218,7 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 	}
 
 	// extract record
-	var dbRecord combyStore.Event
+	var dbRecord internal.Event
 	if err := row.Scan(
 		&dbRecord.ID,
 		&dbRecord.InstanceId,
@@ -242,7 +242,7 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 	}
 
 	// db record to event
-	evt, err := combyStore.DbEventToBaseEvent(&dbRecord)
+	evt, err := internal.DbEventToBaseEvent(&dbRecord)
 	if err != nil {
 		return nil, err
 	}
@@ -351,9 +351,9 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 	}
 
 	// extract results
-	var dbRecords []*combyStore.Event
+	var dbRecords []*internal.Event
 	for rows.Next() {
-		var dbRecord combyStore.Event
+		var dbRecord internal.Event
 		if err := rows.Scan(
 			&dbRecord.ID,
 			&dbRecord.InstanceId,
@@ -379,7 +379,7 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 	}
 
 	// convert
-	evts, err := combyStore.DbEventsToBaseEvents(dbRecords)
+	evts, err := internal.DbEventsToBaseEvents(dbRecords)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -408,7 +408,7 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 	}
 
 	// convert to db format
-	dbRecord, err := combyStore.BaseEventToDbEvent(evt)
+	dbRecord, err := internal.BaseEventToDbEvent(evt)
 	if err != nil {
 		return err
 	}

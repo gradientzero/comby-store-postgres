@@ -5,8 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/gradientzero/comby-store-postgres/internal"
 	"github.com/gradientzero/comby/v2"
-	combyStore "github.com/gradientzero/comby/v2/store"
 	_ "github.com/lib/pq"
 )
 
@@ -132,7 +132,7 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 	}
 
 	// sql statement
-	dbRecord, err := combyStore.BaseCommandToDbCommand(cmd)
+	dbRecord, err := internal.BaseCommandToDbCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -206,7 +206,7 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 	}
 
 	// extract record
-	var dbRecord combyStore.Command
+	var dbRecord internal.Command
 	if err := row.Scan(
 		&dbRecord.ID,
 		&dbRecord.InstanceId,
@@ -228,7 +228,7 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 	}
 
 	// db record to command
-	cmd, err := combyStore.DbCommandToBaseCommand(&dbRecord)
+	cmd, err := internal.DbCommandToBaseCommand(&dbRecord)
 	if err != nil {
 		return nil, err
 	}
@@ -329,9 +329,9 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 	}
 
 	// extract results
-	var dbRecords []*combyStore.Command
+	var dbRecords []*internal.Command
 	for rows.Next() {
-		var dbRecord combyStore.Command
+		var dbRecord internal.Command
 		if err := rows.Scan(
 			&dbRecord.ID,
 			&dbRecord.InstanceId,
@@ -355,7 +355,7 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 	}
 
 	// convert
-	cmds, err := combyStore.DbCommandsToBaseCommands(dbRecords)
+	cmds, err := internal.DbCommandsToBaseCommands(dbRecords)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -383,7 +383,7 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 	}
 
 	// convert to db format
-	dbRecord, err := combyStore.BaseCommandToDbCommand(cmd)
+	dbRecord, err := internal.BaseCommandToDbCommand(cmd)
 	if err != nil {
 		return err
 	}
