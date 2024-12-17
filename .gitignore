@@ -22,3 +22,6 @@
 
 # Go Modules
 go.sum
+
+# Mac
+.DS_Store

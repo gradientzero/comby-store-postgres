@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/gradientzero/comby-postgres-store"
+	"github.com/gradientzero/comby-store-postgres"
 	"github.com/gradientzero/comby/v2"
 )
 

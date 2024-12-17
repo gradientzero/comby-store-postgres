@@ -1,4 +1,4 @@
-# comby-postgres-store
+# comby-store-postgres
 
 Implementation of the EventStore and CommandStore interfaces defined in [comby](https://github.com/gradientzero/comby) with Postgres. **comby** is a powerful application framework designed with Event Sourcing and Command Query Responsibility Segregation (CQRS) principles, written in Go.
 
@@ -17,17 +17,17 @@ docker run --name some-postgres -p 5432:5432 -e POSTGRES_PASSWORD=mysecretpasswo
 
 ## Installation
 
-*comby-postgres-store* supports the latest version of comby (v2), requires Go version 1.22+ and is based on Postgres driver [lib/pq](https://github.com/lib/pq).
+*comby-store-postgres* supports the latest version of comby (v2), requires Go version 1.22+ and is based on Postgres driver [lib/pq](https://github.com/lib/pq).
 
 ```shell
-go get github.com/gradientzero/comby-postgres-store
+go get github.com/gradientzero/comby-store-postgres
 ```
 
 ## Quickstart
 
 ```go
 import (
-	"github.com/gradientzero/comby-postgres-store"
+	"github.com/gradientzero/comby-store-postgres"
 	"github.com/gradientzero/comby/v2"
 )
 
