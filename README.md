@@ -1,6 +1,6 @@
 # comby-postgres-store
 
-Implementation of the EventStore and COmmandStore interfaces defined in [comby](https://github.com/gradientzero/comby) with Postgres. **comby** is a powerful application framework designed with Event Sourcing and Command Query Responsibility Segregation (CQRS) principles, written in Go.
+Implementation of the EventStore and CommandStore interfaces defined in [comby](https://github.com/gradientzero/comby) with Postgres. **comby** is a powerful application framework designed with Event Sourcing and Command Query Responsibility Segregation (CQRS) principles, written in Go.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
