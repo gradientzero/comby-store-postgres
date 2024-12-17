@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Build directories
+/dist/
+/vendor/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.cache
+
+# IDE settings
+.idea/
+.vscode/
+
+# Go Modules
+go.sum
