@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/gradientzero/comby-store-postgres"
+	store "github.com/gradientzero/comby-store-postgres"
 	"github.com/gradientzero/comby/v2"
 )
 
@@ -100,6 +100,126 @@ func TestCommandStore1(t *testing.T) {
 	// check totals
 	if commandStore.Total(ctx) != 1 {
 		t.Fatalf("wrong total %d", commandStore.Total(ctx))
+	}
+
+	// reset database
+	if err := commandStore.Reset(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// close connection
+	if err := commandStore.Close(ctx); err != nil {
+		t.Fatalf("failed to close connection: %v", err)
+	}
+}
+
+func TestCommandStoreEncrypted(t *testing.T) {
+	var err error
+	ctx := context.Background()
+
+	// create crypto service
+	key := []byte("12345678901234567890123456789012")
+	cryptoService, _ := comby.NewCryptoService(key)
+
+	// setup and init store
+	commandStore := store.NewCommandStorePostgres("localhost", 5432, "postgres", "mysecretpassword", "postgres")
+	if err = commandStore.Init(ctx,
+		comby.CommandStoreOptionWithCryptoService(cryptoService),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// create domain data to encrypt/decrypt
+	type MyDomainCommand struct {
+		String  string
+		Int     int64
+		Boolean bool
+	}
+	domainData := &MyDomainCommand{
+		String:  "string",
+		Int:     123,
+		Boolean: true,
+	}
+
+	// Create values
+	cmd1 := &comby.BaseCommand{
+		CommandUuid: comby.NewUuid(),
+		TenantUuid:  "TenantUuid_1",
+		Domain:      "Domain_1",
+		CreatedAt:   1000,
+		DomainCmd:   domainData,
+	}
+	if err := commandStore.Create(ctx,
+		comby.CommandStoreCreateOptionWithCommand(cmd1),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get a value
+	if _cmd1, err := commandStore.Get(ctx,
+		comby.CommandStoreGetOptionWithCommandUuid(cmd1.CommandUuid),
+	); err != nil {
+		t.Fatal(err)
+	} else {
+		_domainData := &MyDomainCommand{}
+		_domainData, _ = comby.Deserialize(_cmd1.GetDomainCmdBytes(), _domainData)
+		if _domainData.String != "string" {
+			t.Fatalf("wrong value: %q", _domainData.String)
+		}
+		if _domainData.Int != 123 {
+			t.Fatalf("wrong value: %q", _domainData.Int)
+		}
+		if _domainData.Boolean != true {
+			t.Fatalf("wrong value")
+		}
+	}
+
+	// List all commands
+	if cmds, _, err := commandStore.List(ctx); err == nil {
+		_cmd1 := cmds[0]
+		_domainData := &MyDomainCommand{}
+		_domainData, _ = comby.Deserialize(_cmd1.GetDomainCmdBytes(), _domainData)
+		if _domainData.String != "string" {
+			t.Fatalf("wrong value: %q", _domainData.String)
+		}
+		if _domainData.Int != 123 {
+			t.Fatalf("wrong value: %q", _domainData.Int)
+		}
+		if _domainData.Boolean != true {
+			t.Fatalf("wrong value")
+		}
+	}
+
+	// Update event
+	domainData.String = "string2"
+	domainData.Int = 456
+	domainData.Boolean = false
+	cmd1.DomainCmd = domainData
+
+	// Delete an event
+	if err := commandStore.Update(ctx,
+		comby.CommandStoreUpdateOptionWithCommand(cmd1),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get a value
+	if _cmd1, err := commandStore.Get(ctx,
+		comby.CommandStoreGetOptionWithCommandUuid(cmd1.CommandUuid),
+	); err != nil {
+		t.Fatal(err)
+	} else {
+		_domainData := &MyDomainCommand{}
+		_domainData, _ = comby.Deserialize(_cmd1.GetDomainCmdBytes(), _domainData)
+		if _domainData.String != "string2" {
+			t.Fatalf("wrong value: %q", _domainData.String)
+		}
+		if _domainData.Int != 456 {
+			t.Fatalf("wrong value: %q", _domainData.Int)
+		}
+		if _domainData.Boolean != false {
+			t.Fatalf("wrong value")
+		}
 	}
 
 	// reset database

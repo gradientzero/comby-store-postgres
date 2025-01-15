@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/gradientzero/comby-store-postgres/internal"
@@ -145,6 +146,13 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 		return err
 	}
 
+	// encrypt domain data if crypto service is provided
+	if es.options.CryptoService != nil {
+		if err := es.encryptDomainData(dbRecord); err != nil {
+			return err
+		}
+	}
+
 	// sql begin transaction
 	tx, err := es.db.Begin()
 	if err != nil {
@@ -237,6 +245,13 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 		case err == sql.ErrNoRows:
 			return nil, nil
 		case err != nil:
+			return nil, err
+		}
+	}
+
+	// decrypt domain data if crypto service is provided
+	if es.options.CryptoService != nil {
+		if err := es.decryptDomainData(&dbRecord); err != nil {
 			return nil, err
 		}
 	}
@@ -378,6 +393,15 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 		return nil, 0, err
 	}
 
+	// decrypt domain data if crypto service is provided
+	if es.options.CryptoService != nil {
+		for _, dbRecord := range dbRecords {
+			if err := es.decryptDomainData(dbRecord); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+
 	// convert
 	evts, err := internal.DbEventsToBaseEvents(dbRecords)
 	if err != nil {
@@ -411,6 +435,13 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 	dbRecord, err := internal.BaseEventToDbEvent(evt)
 	if err != nil {
 		return err
+	}
+
+	// encrypt domain data if crypto service is provided
+	if es.options.CryptoService != nil {
+		if err := es.encryptDomainData(dbRecord); err != nil {
+			return err
+		}
 	}
 
 	// sql begin transaction
@@ -647,6 +678,41 @@ func (es *eventStorePostgres) Reset(ctx context.Context) error {
 	query := "TRUNCATE TABLE events CASCADE;"
 	if _, err := es.db.Exec(query); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (es *eventStorePostgres) encryptDomainData(dbRecord *internal.Event) error {
+	if es.options.CryptoService == nil {
+		return fmt.Errorf("'%s' failed - crypto service is nil", es.String())
+	}
+	domainData := []byte(dbRecord.DataBytes)
+	if len(domainData) < 1 {
+		return fmt.Errorf("'%s' failed - domain data is empty", es.String())
+	}
+	if encryptedData, err := es.options.CryptoService.Encrypt(domainData); err != nil {
+		return fmt.Errorf("'%s' failed - failed to encrypt domain data: %w", es.String(), err)
+	} else {
+		dbRecord.DataBytes = hex.EncodeToString(encryptedData)
+	}
+	return nil
+}
+
+func (es *eventStorePostgres) decryptDomainData(dbRecord *internal.Event) error {
+	if es.options.CryptoService == nil {
+		return fmt.Errorf("'%s' failed - crypto service is nil", es.String())
+	}
+	encryptedData, err := hex.DecodeString(dbRecord.DataBytes)
+	if err != nil {
+		return fmt.Errorf("'%s' failed - failed to decode hex domain data: %w", es.String(), err)
+	}
+	if len(encryptedData) < 1 {
+		return fmt.Errorf("'%s' failed - encrypted domain data is empty", es.String())
+	}
+	if decryptedData, err := es.options.CryptoService.Decrypt(encryptedData); err != nil {
+		return fmt.Errorf("'%s' failed - failed to decrypt domain data: %w", es.String(), err)
+	} else {
+		dbRecord.DataBytes = string(decryptedData)
 	}
 	return nil
 }

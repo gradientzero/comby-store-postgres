@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 
 	"github.com/gradientzero/comby-store-postgres/internal"
@@ -25,14 +26,20 @@ type commandStorePostgres struct {
 	dbName   string
 }
 
-func NewCommandStorePostgres(host string, port int, user, password, dbName string) comby.CommandStore {
-	return &commandStorePostgres{
+func NewCommandStorePostgres(host string, port int, user, password, dbName string, opts ...comby.CommandStoreOption) comby.CommandStore {
+	cs := &commandStorePostgres{
 		host:     host,
 		port:     port,
 		user:     user,
 		password: password,
 		dbName:   dbName,
 	}
+	for _, opt := range opts {
+		if _, err := opt(&cs.options); err != nil {
+			return nil
+		}
+	}
+	return cs
 }
 
 func (cs *commandStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
@@ -137,6 +144,13 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 		return err
 	}
 
+	// encrypt domain data if crypto service is provided
+	if cs.options.CryptoService != nil {
+		if err := cs.encryptDomainData(dbRecord); err != nil {
+			return err
+		}
+	}
+
 	// sql begin transaction
 	tx, err := cs.db.Begin()
 	if err != nil {
@@ -223,6 +237,13 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 		case err == sql.ErrNoRows:
 			return nil, nil
 		case err != nil:
+			return nil, err
+		}
+	}
+
+	// decrypt domain data if crypto service is provided
+	if cs.options.CryptoService != nil {
+		if err := cs.decryptDomainData(&dbRecord); err != nil {
 			return nil, err
 		}
 	}
@@ -354,6 +375,15 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 		return nil, 0, err
 	}
 
+	// decrypt domain data if crypto service is provided
+	if cs.options.CryptoService != nil {
+		for _, dbRecord := range dbRecords {
+			if err := cs.decryptDomainData(dbRecord); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+
 	// convert
 	cmds, err := internal.DbCommandsToBaseCommands(dbRecords)
 	if err != nil {
@@ -388,6 +418,13 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 		return err
 	}
 
+	// encrypt domain data if crypto service is provided
+	if cs.options.CryptoService != nil {
+		if err := cs.encryptDomainData(dbRecord); err != nil {
+			return err
+		}
+	}
+
 	// sql begin transaction
 	tx, err := cs.db.Begin()
 	if err != nil {
@@ -403,7 +440,7 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 		data_type=$5,
 		data_bytes=$6,
 		req_ctx=$7
-	) WHERE uuid=$8 LIMIT 1;`
+	 WHERE uuid=$8;`
 	stmt, err := tx.Prepare(query)
 	if err != nil {
 		return err
@@ -520,6 +557,41 @@ func (cs *commandStorePostgres) Reset(ctx context.Context) error {
 	query := "TRUNCATE TABLE commands CASCADE;"
 	if _, err := cs.db.Exec(query); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (cs *commandStorePostgres) encryptDomainData(dbRecord *internal.Command) error {
+	if cs.options.CryptoService == nil {
+		return fmt.Errorf("'%s' failed - crypto service is nil", cs.String())
+	}
+	domainData := []byte(dbRecord.DataBytes)
+	if len(domainData) < 1 {
+		return fmt.Errorf("'%s' failed - domain data is empty", cs.String())
+	}
+	if encryptedData, err := cs.options.CryptoService.Encrypt(domainData); err != nil {
+		return fmt.Errorf("'%s' failed - failed to encrypt domain data: %w", cs.String(), err)
+	} else {
+		dbRecord.DataBytes = hex.EncodeToString(encryptedData)
+	}
+	return nil
+}
+
+func (cs *commandStorePostgres) decryptDomainData(dbRecord *internal.Command) error {
+	if cs.options.CryptoService == nil {
+		return fmt.Errorf("'%s' failed - crypto service is nil", cs.String())
+	}
+	encryptedData, err := hex.DecodeString(dbRecord.DataBytes)
+	if err != nil {
+		return fmt.Errorf("'%s' failed - failed to decode hex domain data: %w", cs.String(), err)
+	}
+	if len(encryptedData) < 1 {
+		return fmt.Errorf("'%s' failed - encrypted domain data is empty", cs.String())
+	}
+	if decryptedData, err := cs.options.CryptoService.Decrypt(encryptedData); err != nil {
+		return fmt.Errorf("'%s' failed - failed to decrypt domain data: %w", cs.String(), err)
+	} else {
+		dbRecord.DataBytes = string(decryptedData)
 	}
 	return nil
 }
