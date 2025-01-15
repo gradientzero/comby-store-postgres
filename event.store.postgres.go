@@ -26,14 +26,20 @@ type eventStorePostgres struct {
 	dbName   string
 }
 
-func NewEventStorePostgres(host string, port int, user, password, dbName string) comby.EventStore {
-	return &eventStorePostgres{
+func NewEventStorePostgres(host string, port int, user, password, dbName string, opts ...comby.EventStoreOption) comby.EventStore {
+	es := &eventStorePostgres{
 		host:     host,
 		port:     port,
 		user:     user,
 		password: password,
 		dbName:   dbName,
 	}
+	for _, opt := range opts {
+		if _, err := opt(&es.options); err != nil {
+			return nil
+		}
+	}
+	return es
 }
 
 func (es *eventStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
