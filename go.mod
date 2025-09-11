@@ -1,6 +1,6 @@
 module github.com/gradientzero/comby-store-postgres
 
-go 1.22
+go 1.22.0
 
 replace github.com/gradientzero/comby/v2 v2.0.0 => /Users/me/Documents/gradient0/repos/comby/comby
 
