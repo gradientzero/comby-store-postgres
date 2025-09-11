@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/gradientzero/comby-store-postgres"
+	store "github.com/gradientzero/comby-store-postgres"
 	"github.com/gradientzero/comby/v2"
 )
 
@@ -32,6 +32,15 @@ func TestEventStore1(t *testing.T) {
 	// reset database
 	if err := eventStore.Reset(ctx); err != nil {
 		t.Fatal(err)
+	}
+
+	// check info with empty store
+	if m, err := eventStore.Info(ctx); err != nil {
+		t.Fatalf("failed to get info: %v", err)
+	} else {
+		if m.LastItemCreatedAt != 0 {
+			t.Fatalf("wrong last item created at %d", m.LastItemCreatedAt)
+		}
 	}
 
 	// check totals

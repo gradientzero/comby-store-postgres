@@ -34,6 +34,15 @@ func TestCommandStore1(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// check info with empty store
+	if m, err := commandStore.Info(ctx); err != nil {
+		t.Fatalf("failed to get info: %v", err)
+	} else {
+		if m.LastItemCreatedAt != 0 {
+			t.Fatalf("wrong last item created at %d", m.LastItemCreatedAt)
+		}
+	}
+
 	// check totals
 	if commandStore.Total(ctx) != 0 {
 		t.Fatalf("wrong total %d", commandStore.Total(ctx))
