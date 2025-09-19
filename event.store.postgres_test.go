@@ -21,7 +21,7 @@ func TestEventStore1(t *testing.T) {
 	}
 
 	// check if the attribute is set
-	if v, ok := eventStore.Options().Attributes.Get("key1"); ok {
+	if v := eventStore.Options().Attributes.Get("key1"); v != nil {
 		if v != "value" {
 			t.Fatalf("wrong value: %q", v)
 		}
