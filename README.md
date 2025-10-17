@@ -55,8 +55,15 @@ fc, _ := comby.NewFacade(
 
 ## Tests
 
-```shell
-go test -v ./...
+```bash
+go fmt ./...
+go clean -testcache
+go test -v ./... -covermode=count
+go test -v ./... -race
+go vet ./...
+
+# go install honnef.co/go/tools/cmd/staticcheck@latest
+staticcheck ./...
 ```
 
 ## Contributing

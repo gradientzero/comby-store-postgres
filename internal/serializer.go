@@ -23,10 +23,24 @@ func Deserialize(dataBytes []byte, dst interface{}) error {
 
 // helpers
 func BaseEventToDbEvent(evt comby.Event) (*Event, error) {
-	evtDataBytes, err := Serialize(evt.GetDomainEvt())
-	if err != nil {
-		return nil, err
+	var err error
+
+	// serialize event data
+	evtDataBytes := evt.GetDomainEvtBytes()
+
+	// If DomainEvt is set, re-serialize to ensure consistent serialization
+	if evt.GetDomainEvt() != nil {
+		if evtDataBytes, err = Serialize(evt.GetDomainEvt()); err != nil {
+			return nil, err
+		}
 	}
+
+	// Get data type name, fallback to type name from DomainEvt if not set
+	dataType := evt.GetDomainEvtName()
+	if dataType == "" && evt.GetDomainEvt() != nil {
+		dataType = comby.GetTypeName(evt.GetDomainEvt())
+	}
+
 	dbEvent := &Event{
 		InstanceId:    evt.GetInstanceId(),
 		Uuid:          evt.GetEventUuid(),
@@ -36,7 +50,7 @@ func BaseEventToDbEvent(evt comby.Event) (*Event, error) {
 		AggregateUuid: evt.GetAggregateUuid(),
 		Version:       evt.GetVersion(),
 		CreatedAt:     evt.GetCreatedAt(),
-		DataType:      evt.GetDomainEvtName(),
+		DataType:      dataType,
 		DataBytes:     string(evtDataBytes),
 	}
 	return dbEvent, nil
@@ -54,9 +68,10 @@ func DbEventToBaseEvent(dbEvent *Event) (comby.Event, error) {
 		Domain:         dbEvent.Domain,
 		AggregateUuid:  dbEvent.AggregateUuid,
 		Version:        dbEvent.Version,
-		CreatedAt:      dbEvent.CreatedAt,
 		DomainEvtName:  dbEvent.DataType,
 		DomainEvtBytes: []byte(dbEvent.DataBytes),
+		DomainEvt:      nil,
+		CreatedAt:      dbEvent.CreatedAt,
 	}
 	return evt, nil
 }
@@ -74,21 +89,37 @@ func DbEventsToBaseEvents(dbEvents []*Event) ([]comby.Event, error) {
 }
 
 func BaseCommandToDbCommand(cmd comby.Command) (*Command, error) {
-	cmdDataBytes, err := Serialize(cmd.GetDomainCmd())
-	if err != nil {
-		return nil, err
+	var err error
+
+	// serialize command data
+	cmdDataBytes := cmd.GetDomainCmdBytes()
+
+	// If DomainCmd is set, re-serialize to ensure consistent serialization
+	if cmd.GetDomainCmd() != nil {
+		if cmdDataBytes, err = Serialize(cmd.GetDomainCmd()); err != nil {
+			return nil, err
+		}
 	}
+
+	// serialize request context
 	reqCtxBytes, err := Serialize(cmd.GetReqCtx())
 	if err != nil {
 		return nil, err
 	}
+
+	// Get data type name, fallback to type name from DomainCmd if not set
+	dataType := cmd.GetDomainCmdName()
+	if dataType == "" && cmd.GetDomainCmd() != nil {
+		dataType = comby.GetTypeName(cmd.GetDomainCmd())
+	}
+
 	dbCmd := &Command{
 		InstanceId: cmd.GetInstanceId(),
 		Uuid:       cmd.GetCommandUuid(),
 		TenantUuid: cmd.GetTenantUuid(),
 		Domain:     cmd.GetDomain(),
 		CreatedAt:  cmd.GetCreatedAt(),
-		DataType:   cmd.GetDomainCmdName(),
+		DataType:   dataType,
 		DataBytes:  string(cmdDataBytes),
 		ReqCtx:     string(reqCtxBytes),
 	}
@@ -112,9 +143,10 @@ func DbCommandToBaseCommand(dbCmd *Command) (comby.Command, error) {
 		CommandUuid:    dbCmd.Uuid,
 		TenantUuid:     dbCmd.TenantUuid,
 		Domain:         dbCmd.Domain,
-		CreatedAt:      dbCmd.CreatedAt,
 		DomainCmdName:  dbCmd.DataType,
 		DomainCmdBytes: []byte(dbCmd.DataBytes),
+		DomainCmd:      nil,
+		CreatedAt:      dbCmd.CreatedAt,
 		ReqCtx:         &reqCtx,
 	}
 	return cmd, nil
