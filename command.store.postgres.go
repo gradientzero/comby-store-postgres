@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/gradientzero/comby-store-postgres/internal"
 	"github.com/gradientzero/comby/v2"
@@ -68,6 +69,10 @@ func (cs *commandStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
 		return nil, err
 	}
 
+	// PostgreSQL supports full MVCC — concurrent reads and writes are safe.
+	db.SetMaxIdleConns(10)
+	db.SetMaxOpenConns(100)
+
 	// otherwise, return the connection
 	return db, nil
 }
@@ -87,6 +92,12 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS "tenant_index" ON "commands" (
 		"tenant_uuid" ASC
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS "cmd_uuid_index" ON "commands" (
+		"uuid" ASC
+	);
+	CREATE INDEX IF NOT EXISTS "cmd_created_at_index" ON "commands" (
+		"created_at" ASC
 	);
 	`
 	_, err := cs.db.ExecContext(ctx, query)
@@ -156,11 +167,15 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
-	// prepare statement
 	query := `INSERT INTO commands (
-		instance_id, 
-		uuid, 
+		instance_id,
+		uuid,
 		tenant_uuid,
 		domain,
 		created_at,
@@ -168,14 +183,10 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 		data_bytes,
 		req_ctx
 	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8);`
-	stmt, err := tx.Prepare(query)
-	if err != nil {
-		return err
-	}
 
-	// execute statement
-	_, err = stmt.ExecContext(
+	_, err = tx.ExecContext(
 		ctx,
+		query,
 		dbRecord.InstanceId,
 		dbRecord.Uuid,
 		dbRecord.TenantUuid,
@@ -189,13 +200,6 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 		return err
 	}
 
-	// close statement
-	err = stmt.Close()
-	if err != nil {
-		return err
-	}
-
-	// commit statement
 	return tx.Commit()
 }
 
@@ -207,14 +211,14 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 		}
 	}
 
-	// prepare query
-	var query string = "SELECT * FROM commands LIMIT 1;"
-	if len(getOpts.CommandUuid) > 0 {
-		query = fmt.Sprintf("SELECT * FROM commands WHERE uuid='%s' LIMIT 1;", getOpts.CommandUuid)
+	if len(getOpts.CommandUuid) == 0 {
+		return nil, fmt.Errorf("'%s' failed to get command - command uuid is required", cs.String())
 	}
 
-	// run query (no args to not using prepared statement)
-	row := cs.db.QueryRowContext(ctx, query)
+	query := `SELECT id, instance_id, uuid, tenant_uuid, domain,
+		created_at, data_type, data_bytes, req_ctx
+		FROM commands WHERE uuid=$1 LIMIT 1;`
+	row := cs.db.QueryRowContext(ctx, query, getOpts.CommandUuid)
 	if row.Err() != nil {
 		return nil, row.Err()
 	}
@@ -271,43 +275,51 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 		}
 	}
 
-	// prepare statement: (do NOT used them for Query/QueryContext)
-	// 1. see different syntax for postgres:
-	// http://go-database-sql.org/prepared.html#parameter-placeholder-syntax
-	// 2. db.Query and db.QueryContext for some reason it does not work as expected
-	// (seems to be something internally in database/sql because for SQLite and Postgres
-	// simply does not return the expected result after sending new values to prepared statement)
+	// Build WHERE clause with parameterized queries
 	var whereSQL string = ""
 	var whereList []string = []string{}
+	var args []any
+	paramIdx := 0
 	if len(listOpts.TenantUuid) > 0 {
-		whereList = append(whereList, fmt.Sprintf("tenant_uuid='%s'", listOpts.TenantUuid))
+		paramIdx++
+		whereList = append(whereList, fmt.Sprintf("tenant_uuid=$%d", paramIdx))
+		args = append(args, listOpts.TenantUuid)
 	}
 	if len(listOpts.Domain) > 0 {
-		whereList = append(whereList, fmt.Sprintf("domain='%s'", listOpts.Domain))
+		paramIdx++
+		whereList = append(whereList, fmt.Sprintf("domain=$%d", paramIdx))
+		args = append(args, listOpts.Domain)
 	}
 	if len(listOpts.DataType) > 0 {
-		whereList = append(whereList, fmt.Sprintf("data_type='%s'", listOpts.DataType))
+		paramIdx++
+		whereList = append(whereList, fmt.Sprintf("data_type=$%d", paramIdx))
+		args = append(args, listOpts.DataType)
 	}
 	if listOpts.Before >= 0 {
-		whereList = append(whereList, fmt.Sprintf("created_at<%d", listOpts.Before))
+		paramIdx++
+		whereList = append(whereList, fmt.Sprintf("created_at<$%d", paramIdx))
+		args = append(args, listOpts.Before)
 	}
 	if listOpts.After >= 0 {
-		whereList = append(whereList, fmt.Sprintf("created_at>%d", listOpts.After))
+		paramIdx++
+		whereList = append(whereList, fmt.Sprintf("created_at>$%d", paramIdx))
+		args = append(args, listOpts.After)
 	}
 
 	// note the first empty character(s) below
-	for index, where := range whereList {
-		if index == 0 {
-			whereSQL = fmt.Sprintf(" WHERE %s", where)
-		} else {
-			whereSQL = fmt.Sprintf("%s AND %s", whereSQL, where)
-		}
+	if len(whereList) > 0 {
+		whereSQL = " WHERE " + strings.Join(whereList, " AND ")
 	}
 
 	// count the total number of records for this query
 	var queryTotal int64
 	var queryTotalQuery string = fmt.Sprintf("SELECT COUNT(id) FROM commands%s;", whereSQL)
-	row := cs.db.QueryRowContext(ctx, queryTotalQuery)
+	var row *sql.Row
+	if len(args) > 0 {
+		row = cs.db.QueryRowContext(ctx, queryTotalQuery, args...)
+	} else {
+		row = cs.db.QueryRowContext(ctx, queryTotalQuery)
+	}
 	if err := row.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -336,9 +348,15 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 		offsetSQL = fmt.Sprintf(" OFFSET %d", listOpts.Offset)
 	}
 
-	// run query (no args to not using prepared statement - see above for more info)
-	var query string = fmt.Sprintf("SELECT * FROM commands%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
-	rows, err := cs.db.QueryContext(ctx, query)
+	// run query with parameterized values
+	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, domain, created_at, data_type, data_bytes, req_ctx FROM commands%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
+	var rows *sql.Rows
+	var err error
+	if len(args) > 0 {
+		rows, err = cs.db.QueryContext(ctx, query, args...)
+	} else {
+		rows, err = cs.db.QueryContext(ctx, query)
+	}
 	switch {
 	case err == sql.ErrNoRows:
 		return nil, queryTotal, nil
@@ -430,10 +448,14 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil {
+			tx.Rollback()
+		}
+	}()
 
-	// prepare statement
 	query := `UPDATE commands SET
-		instance_id=$1, 
+		instance_id=$1,
 		tenant_uuid=$2,
 		domain=$3,
 		created_at=$4,
@@ -441,13 +463,9 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 		data_bytes=$6,
 		req_ctx=$7
 	 WHERE uuid=$8;`
-	stmt, err := tx.Prepare(query)
-	if err != nil {
-		return err
-	}
 
-	// execute statement
-	_, err = stmt.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
+		query,
 		dbRecord.InstanceId,
 		dbRecord.TenantUuid,
 		dbRecord.Domain,
@@ -460,13 +478,6 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 		return err
 	}
 
-	// close statement
-	err = stmt.Close()
-	if err != nil {
-		return err
-	}
-
-	// commit statement
 	return tx.Commit()
 }
 
@@ -485,9 +496,9 @@ func (cs *commandStorePostgres) Delete(ctx context.Context, opts ...comby.Comman
 		return fmt.Errorf("'%s' failed to delete command - command uuid '%s' is invalid", cs.String(), commandUuid)
 	}
 
-	// run query (no args to not using prepared statement)
-	query := fmt.Sprintf("DELETE FROM commands WHERE uuid='%s';", commandUuid)
-	_, err := cs.db.ExecContext(ctx, query)
+	// run query with parameterized values
+	query := "DELETE FROM commands WHERE uuid=$1;"
+	_, err := cs.db.ExecContext(ctx, query, commandUuid)
 	return err
 }
 
@@ -519,8 +530,7 @@ func (cs *commandStorePostgres) String() string {
 func (cs *commandStorePostgres) Info(ctx context.Context) (*comby.CommandStoreInfoModel, error) {
 
 	// run extra total query (no args to not using prepared statement)
-	var totalQuery string = fmt.Sprintf("SELECT COUNT(uuid) FROM commands;")
-	row := cs.db.QueryRowContext(ctx, totalQuery)
+	row := cs.db.QueryRowContext(ctx, "SELECT COUNT(uuid) FROM commands;")
 	if err := row.Err(); err != nil {
 		return nil, err
 	}
@@ -531,8 +541,7 @@ func (cs *commandStorePostgres) Info(ctx context.Context) (*comby.CommandStoreIn
 	}
 
 	// run extra total query (no args to not using prepared statement)
-	var lastEventQuery string = fmt.Sprintf("SELECT COALESCE(MAX(created_at), 0) FROM commands;")
-	row = cs.db.QueryRowContext(ctx, lastEventQuery)
+	row = cs.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(created_at), 0) FROM commands;")
 	if err := row.Err(); err != nil {
 		return nil, err
 	}
