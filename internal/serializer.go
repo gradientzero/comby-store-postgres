@@ -25,11 +25,9 @@ func Deserialize(dataBytes []byte, dst interface{}) error {
 func BaseEventToDbEvent(evt comby.Event) (*Event, error) {
 	var err error
 
-	// serialize event data
+	// serialize event data — prefer already-serialized bytes to avoid double serialization
 	evtDataBytes := evt.GetDomainEvtBytes()
-
-	// If DomainEvt is set, re-serialize to ensure consistent serialization
-	if evt.GetDomainEvt() != nil {
+	if len(evtDataBytes) == 0 && evt.GetDomainEvt() != nil {
 		if evtDataBytes, err = Serialize(evt.GetDomainEvt()); err != nil {
 			return nil, err
 		}
@@ -91,11 +89,9 @@ func DbEventsToBaseEvents(dbEvents []*Event) ([]comby.Event, error) {
 func BaseCommandToDbCommand(cmd comby.Command) (*Command, error) {
 	var err error
 
-	// serialize command data
+	// serialize command data — prefer already-serialized bytes to avoid double serialization
 	cmdDataBytes := cmd.GetDomainCmdBytes()
-
-	// If DomainCmd is set, re-serialize to ensure consistent serialization
-	if cmd.GetDomainCmd() != nil {
+	if len(cmdDataBytes) == 0 && cmd.GetDomainCmd() != nil {
 		if cmdDataBytes, err = Serialize(cmd.GetDomainCmd()); err != nil {
 			return nil, err
 		}
