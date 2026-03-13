@@ -34,4 +34,5 @@ type Event struct {
 	CreatedAt     int64  `json:"created_at"`
 	DataType      string `json:"data_type"`
 	DataBytes     string `json:"data_bytes"`
+	ReqCtx        string `json:"req_ctx"`
 }

@@ -39,6 +39,14 @@ func BaseEventToDbEvent(evt comby.Event) (*Event, error) {
 		dataType = comby.GetTypeName(evt.GetDomainEvt())
 	}
 
+	// serialize request context
+	var reqCtxStr string
+	if reqCtx := evt.GetReqCtx(); reqCtx != nil {
+		if reqCtxBytes, err := Serialize(reqCtx); err == nil {
+			reqCtxStr = string(reqCtxBytes)
+		}
+	}
+
 	dbEvent := &Event{
 		InstanceId:    evt.GetInstanceId(),
 		Uuid:          evt.GetEventUuid(),
@@ -50,6 +58,7 @@ func BaseEventToDbEvent(evt comby.Event) (*Event, error) {
 		CreatedAt:     evt.GetCreatedAt(),
 		DataType:      dataType,
 		DataBytes:     string(evtDataBytes),
+		ReqCtx:        reqCtxStr,
 	}
 	return dbEvent, nil
 }
@@ -58,6 +67,14 @@ func DbEventToBaseEvent(dbEvent *Event) (comby.Event, error) {
 	// Data of type base.EventData can not be deserialized
 	// but within the facade the corresponding event data provider
 	// will take care of this
+	var reqCtx *comby.RequestContext
+	if len(dbEvent.ReqCtx) > 0 {
+		reqCtx = &comby.RequestContext{}
+		if err := Deserialize([]byte(dbEvent.ReqCtx), reqCtx); err != nil {
+			return nil, err
+		}
+	}
+
 	evt := &comby.BaseEvent{
 		InstanceId:     dbEvent.InstanceId,
 		EventUuid:      dbEvent.Uuid,
@@ -70,6 +87,7 @@ func DbEventToBaseEvent(dbEvent *Event) (comby.Event, error) {
 		DomainEvtBytes: []byte(dbEvent.DataBytes),
 		DomainEvt:      nil,
 		CreatedAt:      dbEvent.CreatedAt,
+		ReqCtx:         reqCtx,
 	}
 	return evt, nil
 }

@@ -89,7 +89,8 @@ func (es *eventStorePostgres) migrate(ctx context.Context) error {
 		version INTEGER,
 		created_at BIGINT,
 		data_type TEXT,
-		data_bytes TEXT
+		data_bytes TEXT,
+		req_ctx TEXT
 	);
 	CREATE INDEX IF NOT EXISTS "tenant_index" ON "events" (
 		"tenant_uuid" ASC
@@ -104,8 +105,16 @@ func (es *eventStorePostgres) migrate(ctx context.Context) error {
 		"created_at" ASC
 	);
 	`
-	_, err := es.db.ExecContext(ctx, query)
-	return err
+	if _, err := es.db.ExecContext(ctx, query); err != nil {
+		return err
+	}
+
+	// migrate existing databases: add req_ctx column if it doesn't exist
+	if _, err := es.db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN IF NOT EXISTS req_ctx TEXT`); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // fullfilling EventStore interface
@@ -188,8 +197,9 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 	version,
 	created_at,
 	data_type,
-	data_bytes
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10);`
+	data_bytes,
+	req_ctx
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11);`
 
 	_, err = tx.ExecContext(
 		ctx,
@@ -204,6 +214,7 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 		dbRecord.CreatedAt,
 		dbRecord.DataType,
 		dbRecord.DataBytes,
+		dbRecord.ReqCtx,
 	)
 	if err != nil {
 		return err
@@ -225,7 +236,7 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 	}
 
 	query := `SELECT id, instance_id, uuid, tenant_uuid, command_uuid, domain,
-		aggregate_uuid, version, created_at, data_type, data_bytes
+		aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '')
 		FROM events WHERE uuid=$1 LIMIT 1;`
 	row := es.db.QueryRowContext(ctx, query, getOpts.EventUuid)
 	if row.Err() != nil {
@@ -246,6 +257,7 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 		&dbRecord.CreatedAt,
 		&dbRecord.DataType,
 		&dbRecord.DataBytes,
+		&dbRecord.ReqCtx,
 	); err != nil {
 		// Catch errors
 		switch {
@@ -378,7 +390,7 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 	}
 
 	// run query with parameterized values
-	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, command_uuid, domain, aggregate_uuid, version, created_at, data_type, data_bytes FROM events%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
+	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, command_uuid, domain, aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '') FROM events%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
 	var rows *sql.Rows
 	var err error
 	if len(args) > 0 {
@@ -412,6 +424,7 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 			&dbRecord.CreatedAt,
 			&dbRecord.DataType,
 			&dbRecord.DataBytes,
+			&dbRecord.ReqCtx,
 		); err != nil {
 			return nil, 0, err
 		}
@@ -495,8 +508,9 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 		version=$6,
 		created_at=$7,
 		data_type=$8,
-		data_bytes=$9
-	 WHERE uuid=$10;`
+		data_bytes=$9,
+		req_ctx=$10
+	 WHERE uuid=$11;`
 
 	_, err = tx.ExecContext(ctx,
 		query,
@@ -509,6 +523,7 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 		dbRecord.CreatedAt,
 		dbRecord.DataType,
 		dbRecord.DataBytes,
+		dbRecord.ReqCtx,
 		dbRecord.Uuid)
 	if err != nil {
 		return err
