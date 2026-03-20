@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gradientzero/comby-store-postgres/internal"
 	"github.com/gradientzero/comby/v2"
@@ -70,10 +71,31 @@ func (cs *commandStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
 	}
 
 	// PostgreSQL supports full MVCC — concurrent reads and writes are safe.
-	db.SetMaxIdleConns(10)
-	db.SetMaxOpenConns(100)
+	// Apply pool settings from options, falling back to sensible defaults.
+	maxOpenConns := 25
+	if cs.options.MaxOpenConns > 0 {
+		maxOpenConns = cs.options.MaxOpenConns
+	}
+	db.SetMaxOpenConns(maxOpenConns)
 
-	// otherwise, return the connection
+	maxIdleConns := 5
+	if cs.options.MaxIdleConns > 0 {
+		maxIdleConns = cs.options.MaxIdleConns
+	}
+	db.SetMaxIdleConns(maxIdleConns)
+
+	if cs.options.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(cs.options.ConnMaxLifetime)
+	} else {
+		db.SetConnMaxLifetime(30 * time.Minute)
+	}
+
+	if cs.options.ConnMaxIdleTime > 0 {
+		db.SetConnMaxIdleTime(cs.options.ConnMaxIdleTime)
+	} else {
+		db.SetConnMaxIdleTime(5 * time.Minute)
+	}
+
 	return db, nil
 }
 

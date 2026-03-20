@@ -4,16 +4,48 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/gradientzero/comby/v2"
 	_ "github.com/lib/pq"
 )
+
+// SnapshotStorePostgresOption configures the PostgreSQL snapshot store.
+type SnapshotStorePostgresOption func(*snapshotStorePostgresConfig)
+
+type snapshotStorePostgresConfig struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+}
+
+// SnapshotStorePostgresWithMaxOpenConns sets the maximum number of open connections.
+func SnapshotStorePostgresWithMaxOpenConns(n int) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) { c.MaxOpenConns = n }
+}
+
+// SnapshotStorePostgresWithMaxIdleConns sets the maximum number of idle connections.
+func SnapshotStorePostgresWithMaxIdleConns(n int) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) { c.MaxIdleConns = n }
+}
+
+// SnapshotStorePostgresWithConnMaxLifetime sets the maximum connection lifetime.
+func SnapshotStorePostgresWithConnMaxLifetime(d time.Duration) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) { c.ConnMaxLifetime = d }
+}
+
+// SnapshotStorePostgresWithConnMaxIdleTime sets the maximum connection idle time.
+func SnapshotStorePostgresWithConnMaxIdleTime(d time.Duration) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) { c.ConnMaxIdleTime = d }
+}
 
 // Make sure it implements interfaces
 var _ comby.SnapshotStore = (*snapshotStorePostgres)(nil)
 
 type snapshotStorePostgres struct {
 	db       *sql.DB
+	config   snapshotStorePostgresConfig
 	host     string
 	port     int
 	user     string
@@ -21,14 +53,18 @@ type snapshotStorePostgres struct {
 	dbName   string
 }
 
-func NewSnapshotStorePostgres(host string, port int, user, password, dbName string) comby.SnapshotStore {
-	return &snapshotStorePostgres{
+func NewSnapshotStorePostgres(host string, port int, user, password, dbName string, opts ...SnapshotStorePostgresOption) comby.SnapshotStore {
+	s := &snapshotStorePostgres{
 		host:     host,
 		port:     port,
 		user:     user,
 		password: password,
 		dbName:   dbName,
 	}
+	for _, opt := range opts {
+		opt(&s.config)
+	}
+	return s
 }
 
 func (s *snapshotStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
@@ -52,8 +88,30 @@ func (s *snapshotStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
 		return nil, err
 	}
 
-	db.SetMaxIdleConns(10)
-	db.SetMaxOpenConns(100)
+	// Apply pool settings from config, falling back to sensible defaults.
+	maxOpenConns := 10
+	if s.config.MaxOpenConns > 0 {
+		maxOpenConns = s.config.MaxOpenConns
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+
+	maxIdleConns := 5
+	if s.config.MaxIdleConns > 0 {
+		maxIdleConns = s.config.MaxIdleConns
+	}
+	db.SetMaxIdleConns(maxIdleConns)
+
+	if s.config.ConnMaxLifetime > 0 {
+		db.SetConnMaxLifetime(s.config.ConnMaxLifetime)
+	} else {
+		db.SetConnMaxLifetime(30 * time.Minute)
+	}
+
+	if s.config.ConnMaxIdleTime > 0 {
+		db.SetConnMaxIdleTime(s.config.ConnMaxIdleTime)
+	} else {
+		db.SetConnMaxIdleTime(5 * time.Minute)
+	}
 
 	return db, nil
 }
