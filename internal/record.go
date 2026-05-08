@@ -9,15 +9,15 @@ type Command struct {
 	ID sql.NullInt64
 
 	// fields
-	InstanceId    int64  `json:"_instance_id"`
-	Uuid          string `json:"_uuid"`
-	TenantUuid    string `json:"_tenant_uuid"`
-	WorkspaceUuid string `json:"_workspace_uuid"`
-	Domain        string `json:"_domain"`
-	CreatedAt     int64  `json:"_created_at"`
-	DataType      string `json:"_data_type"`
-	DataBytes     string `json:"_data_bytes"`
-	ReqCtx        string `json:"_req_ctx"`
+	InstanceId    int64  `json:"instance_id"`
+	Uuid          string `json:"uuid"`
+	TenantUuid    string `json:"tenant_uuid"`
+	WorkspaceUuid string `json:"workspace_uuid"`
+	Domain        string `json:"domain"`
+	CreatedAt     int64  `json:"created_at"`
+	DataType      string `json:"data_type"`
+	DataBytes     string `json:"data_bytes"`
+	ReqCtx        string `json:"req_ctx"`
 }
 
 type Event struct {
@@ -25,16 +25,16 @@ type Event struct {
 	ID sql.NullInt64
 
 	// fields
-	InstanceId    int64  `json:"_instance_id"`
-	Uuid          string `json:"_uuid"`
-	TenantUuid    string `json:"_tenant_uuid"`
-	WorkspaceUuid string `json:"_workspace_uuid"`
-	CommandUuid   string `json:"_command_uuid"`
-	Domain        string `json:"_domain"`
-	AggregateUuid string `json:"_aggregate_uuid"`
-	Version       int64  `json:"_version"`
-	CreatedAt     int64  `json:"_created_at"`
-	DataType      string `json:"_data_type"`
-	DataBytes     string `json:"_data_bytes"`
-	ReqCtx        string `json:"_req_ctx"`
+	InstanceId    int64  `json:"instance_id"`
+	Uuid          string `json:"uuid"`
+	TenantUuid    string `json:"tenant_uuid"`
+	WorkspaceUuid string `json:"workspace_uuid"`
+	CommandUuid   string `json:"command_uuid"`
+	Domain        string `json:"domain"`
+	AggregateUuid string `json:"aggregate_uuid"`
+	Version       int64  `json:"version"`
+	CreatedAt     int64  `json:"created_at"`
+	DataType      string `json:"data_type"`
+	DataBytes     string `json:"data_bytes"`
+	ReqCtx        string `json:"req_ctx"`
 }
