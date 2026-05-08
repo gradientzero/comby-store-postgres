@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gradientzero/comby-store-postgres/internal"
-	"github.com/gradientzero/comby/v2"
+	"github.com/gradientzero/comby/v3"
 	_ "github.com/lib/pq"
 )
 

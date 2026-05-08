@@ -3,7 +3,7 @@ package internal
 import (
 	"encoding/json"
 
-	"github.com/gradientzero/comby/v2"
+	"github.com/gradientzero/comby/v3"
 )
 
 func Serialize(src interface{}) ([]byte, error) {

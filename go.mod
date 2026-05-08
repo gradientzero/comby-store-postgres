@@ -3,7 +3,7 @@ module github.com/gradientzero/comby-store-postgres
 go 1.22.0
 
 require (
-	github.com/gradientzero/comby/v2 v2.15.0
+	github.com/gradientzero/comby/v3 v3.0.0
 	github.com/lib/pq v1.10.9
 )
 
@@ -30,4 +30,4 @@ require (
 	modernc.org/token v1.0.1 // indirect
 )
 
-replace github.com/gradientzero/comby/v2 => /Users/me/Documents/gradient0/repos/comby/comby
+replace github.com/gradientzero/comby/v3 => /Users/me/Documents/gradient0/repos/comby/comby
