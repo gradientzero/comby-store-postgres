@@ -105,6 +105,7 @@ func (es *eventStorePostgres) migrate(ctx context.Context) error {
 		instance_id INTEGER,
 		uuid TEXT,
 		tenant_uuid TEXT,
+		workspace_uuid TEXT,
 		command_uuid TEXT,
 		domain TEXT,
 		aggregate_uuid TEXT,
@@ -116,6 +117,9 @@ func (es *eventStorePostgres) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS "tenant_index" ON "events" (
 		"tenant_uuid" ASC
+	);
+	CREATE INDEX IF NOT EXISTS "workspace_index" ON "events" (
+		"workspace_uuid" ASC
 	);
 	CREATE INDEX IF NOT EXISTS "aggregate_uuid_index" ON "events" (
 		"aggregate_uuid" ASC
@@ -133,6 +137,11 @@ func (es *eventStorePostgres) migrate(ctx context.Context) error {
 
 	// migrate existing databases: add req_ctx column if it doesn't exist
 	if _, err := es.db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN IF NOT EXISTS req_ctx TEXT`); err != nil {
+		return err
+	}
+
+	// migrate existing databases: add workspace_uuid column if it doesn't exist
+	if _, err := es.db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN IF NOT EXISTS workspace_uuid TEXT`); err != nil {
 		return err
 	}
 
@@ -213,6 +222,7 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 	instance_id,
 	uuid,
 	tenant_uuid,
+	workspace_uuid,
 	command_uuid,
 	domain,
 	aggregate_uuid,
@@ -221,7 +231,7 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 	data_type,
 	data_bytes,
 	req_ctx
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11);`
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12);`
 
 	_, err = tx.ExecContext(
 		ctx,
@@ -229,6 +239,7 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 		dbRecord.InstanceId,
 		dbRecord.Uuid,
 		dbRecord.TenantUuid,
+		dbRecord.WorkspaceUuid,
 		dbRecord.CommandUuid,
 		dbRecord.Domain,
 		dbRecord.AggregateUuid,
@@ -257,7 +268,7 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 		return nil, fmt.Errorf("'%s' failed to get event - event uuid is required", es.String())
 	}
 
-	query := `SELECT id, instance_id, uuid, tenant_uuid, command_uuid, domain,
+	query := `SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), command_uuid, domain,
 		aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '')
 		FROM events WHERE uuid=$1 LIMIT 1;`
 	row := es.db.QueryRowContext(ctx, query, getOpts.EventUuid)
@@ -272,6 +283,7 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 		&dbRecord.InstanceId,
 		&dbRecord.Uuid,
 		&dbRecord.TenantUuid,
+		&dbRecord.WorkspaceUuid,
 		&dbRecord.CommandUuid,
 		&dbRecord.Domain,
 		&dbRecord.AggregateUuid,
@@ -412,7 +424,7 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 	}
 
 	// run query with parameterized values
-	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, command_uuid, domain, aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '') FROM events%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
+	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), command_uuid, domain, aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '') FROM events%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
 	var rows *sql.Rows
 	var err error
 	if len(args) > 0 {
@@ -439,6 +451,7 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 			&dbRecord.InstanceId,
 			&dbRecord.Uuid,
 			&dbRecord.TenantUuid,
+			&dbRecord.WorkspaceUuid,
 			&dbRecord.CommandUuid,
 			&dbRecord.Domain,
 			&dbRecord.AggregateUuid,
@@ -524,20 +537,22 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 	query := `UPDATE events SET
 		instance_id=$1,
 		tenant_uuid=$2,
-		command_uuid=$3,
-		domain=$4,
-		aggregate_uuid=$5,
-		version=$6,
-		created_at=$7,
-		data_type=$8,
-		data_bytes=$9,
-		req_ctx=$10
-	 WHERE uuid=$11;`
+		workspace_uuid=$3,
+		command_uuid=$4,
+		domain=$5,
+		aggregate_uuid=$6,
+		version=$7,
+		created_at=$8,
+		data_type=$9,
+		data_bytes=$10,
+		req_ctx=$11
+	 WHERE uuid=$12;`
 
 	_, err = tx.ExecContext(ctx,
 		query,
 		dbRecord.InstanceId,
 		dbRecord.TenantUuid,
+		dbRecord.WorkspaceUuid,
 		dbRecord.CommandUuid,
 		dbRecord.Domain,
 		dbRecord.AggregateUuid,

@@ -120,14 +120,27 @@ func (s *snapshotStorePostgres) migrate(ctx context.Context) error {
 	query := `
 	CREATE TABLE IF NOT EXISTS snapshots (
 		aggregate_uuid TEXT PRIMARY KEY,
+		tenant_uuid TEXT,
+		workspace_uuid TEXT,
 		domain TEXT NOT NULL,
 		version BIGINT NOT NULL,
 		data BYTEA NOT NULL,
 		created_at BIGINT NOT NULL
 	);
+	CREATE INDEX IF NOT EXISTS "snapshots_tenant_index" ON "snapshots" ("tenant_uuid" ASC);
+	CREATE INDEX IF NOT EXISTS "snapshots_workspace_index" ON "snapshots" ("workspace_uuid" ASC);
 	`
-	_, err := s.db.ExecContext(ctx, query)
-	return err
+	if _, err := s.db.ExecContext(ctx, query); err != nil {
+		return err
+	}
+	// migrate existing databases: add tenant_uuid + workspace_uuid columns if they don't exist
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS tenant_uuid TEXT`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS workspace_uuid TEXT`); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *snapshotStorePostgres) Init(ctx context.Context) error {
@@ -148,9 +161,11 @@ func (s *snapshotStorePostgres) Save(ctx context.Context, model *comby.SnapshotS
 		return fmt.Errorf("snapshot model is nil")
 	}
 
-	query := `INSERT INTO snapshots (aggregate_uuid, domain, version, data, created_at)
-		VALUES ($1, $2, $3, $4, $5)
+	query := `INSERT INTO snapshots (aggregate_uuid, tenant_uuid, workspace_uuid, domain, version, data, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT(aggregate_uuid) DO UPDATE SET
+			tenant_uuid=EXCLUDED.tenant_uuid,
+			workspace_uuid=EXCLUDED.workspace_uuid,
 			domain=EXCLUDED.domain,
 			version=EXCLUDED.version,
 			data=EXCLUDED.data,
@@ -158,6 +173,8 @@ func (s *snapshotStorePostgres) Save(ctx context.Context, model *comby.SnapshotS
 
 	_, err := s.db.ExecContext(ctx, query,
 		model.AggregateUuid,
+		model.TenantUuid,
+		model.WorkspaceUuid,
 		model.Domain,
 		model.Version,
 		model.Data,
@@ -167,7 +184,7 @@ func (s *snapshotStorePostgres) Save(ctx context.Context, model *comby.SnapshotS
 }
 
 func (s *snapshotStorePostgres) GetLatest(ctx context.Context, aggregateUuid string) (*comby.SnapshotStoreModel, error) {
-	query := `SELECT aggregate_uuid, domain, version, data, created_at
+	query := `SELECT aggregate_uuid, COALESCE(tenant_uuid, ''), COALESCE(workspace_uuid, ''), domain, version, data, created_at
 		FROM snapshots WHERE aggregate_uuid=$1 LIMIT 1;`
 
 	row := s.db.QueryRowContext(ctx, query, aggregateUuid)
@@ -175,6 +192,8 @@ func (s *snapshotStorePostgres) GetLatest(ctx context.Context, aggregateUuid str
 	var model comby.SnapshotStoreModel
 	if err := row.Scan(
 		&model.AggregateUuid,
+		&model.TenantUuid,
+		&model.WorkspaceUuid,
 		&model.Domain,
 		&model.Version,
 		&model.Data,

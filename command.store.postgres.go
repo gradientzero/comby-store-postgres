@@ -106,6 +106,7 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 		instance_id INTEGER,
 		uuid TEXT,
 		tenant_uuid TEXT,
+		workspace_uuid TEXT,
 		domain TEXT,
 		created_at BIGINT,
 		data_type TEXT,
@@ -115,6 +116,9 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS "tenant_index" ON "commands" (
 		"tenant_uuid" ASC
 	);
+	CREATE INDEX IF NOT EXISTS "workspace_index" ON "commands" (
+		"workspace_uuid" ASC
+	);
 	CREATE UNIQUE INDEX IF NOT EXISTS "cmd_uuid_index" ON "commands" (
 		"uuid" ASC
 	);
@@ -122,8 +126,14 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 		"created_at" ASC
 	);
 	`
-	_, err := cs.db.ExecContext(ctx, query)
-	return err
+	if _, err := cs.db.ExecContext(ctx, query); err != nil {
+		return err
+	}
+	// migrate existing databases: add workspace_uuid column if it doesn't exist
+	if _, err := cs.db.ExecContext(ctx, `ALTER TABLE commands ADD COLUMN IF NOT EXISTS workspace_uuid TEXT`); err != nil {
+		return err
+	}
+	return nil
 }
 
 // fullfilling CommandStore interface
@@ -199,12 +209,13 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 		instance_id,
 		uuid,
 		tenant_uuid,
+		workspace_uuid,
 		domain,
 		created_at,
 		data_type,
 		data_bytes,
 		req_ctx
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8);`
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9);`
 
 	_, err = tx.ExecContext(
 		ctx,
@@ -212,6 +223,7 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 		dbRecord.InstanceId,
 		dbRecord.Uuid,
 		dbRecord.TenantUuid,
+		dbRecord.WorkspaceUuid,
 		dbRecord.Domain,
 		dbRecord.CreatedAt,
 		dbRecord.DataType,
@@ -237,7 +249,7 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 		return nil, fmt.Errorf("'%s' failed to get command - command uuid is required", cs.String())
 	}
 
-	query := `SELECT id, instance_id, uuid, tenant_uuid, domain,
+	query := `SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), domain,
 		created_at, data_type, data_bytes, req_ctx
 		FROM commands WHERE uuid=$1 LIMIT 1;`
 	row := cs.db.QueryRowContext(ctx, query, getOpts.CommandUuid)
@@ -252,6 +264,7 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 		&dbRecord.InstanceId,
 		&dbRecord.Uuid,
 		&dbRecord.TenantUuid,
+		&dbRecord.WorkspaceUuid,
 		&dbRecord.Domain,
 		&dbRecord.CreatedAt,
 		&dbRecord.DataType,
@@ -371,7 +384,7 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 	}
 
 	// run query with parameterized values
-	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, domain, created_at, data_type, data_bytes, req_ctx FROM commands%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
+	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), domain, created_at, data_type, data_bytes, req_ctx FROM commands%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
 	var rows *sql.Rows
 	var err error
 	if len(args) > 0 {
@@ -398,6 +411,7 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 			&dbRecord.InstanceId,
 			&dbRecord.Uuid,
 			&dbRecord.TenantUuid,
+			&dbRecord.WorkspaceUuid,
 			&dbRecord.Domain,
 			&dbRecord.CreatedAt,
 			&dbRecord.DataType,
@@ -479,17 +493,19 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 	query := `UPDATE commands SET
 		instance_id=$1,
 		tenant_uuid=$2,
-		domain=$3,
-		created_at=$4,
-		data_type=$5,
-		data_bytes=$6,
-		req_ctx=$7
-	 WHERE uuid=$8;`
+		workspace_uuid=$3,
+		domain=$4,
+		created_at=$5,
+		data_type=$6,
+		data_bytes=$7,
+		req_ctx=$8
+	 WHERE uuid=$9;`
 
 	_, err = tx.ExecContext(ctx,
 		query,
 		dbRecord.InstanceId,
 		dbRecord.TenantUuid,
+		dbRecord.WorkspaceUuid,
 		dbRecord.Domain,
 		dbRecord.CreatedAt,
 		dbRecord.DataType,

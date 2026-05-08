@@ -51,6 +51,7 @@ func BaseEventToDbEvent(evt comby.Event) (*Event, error) {
 		InstanceId:    evt.GetInstanceId(),
 		Uuid:          evt.GetEventUuid(),
 		TenantUuid:    evt.GetTenantUuid(),
+		WorkspaceUuid: evt.GetWorkspaceUuid(),
 		CommandUuid:   evt.GetCommandUuid(),
 		Domain:        evt.GetDomain(),
 		AggregateUuid: evt.GetAggregateUuid(),
@@ -79,6 +80,7 @@ func DbEventToBaseEvent(dbEvent *Event) (comby.Event, error) {
 		InstanceId:     dbEvent.InstanceId,
 		EventUuid:      dbEvent.Uuid,
 		TenantUuid:     dbEvent.TenantUuid,
+		WorkspaceUuid:  dbEvent.WorkspaceUuid,
 		CommandUuid:    dbEvent.CommandUuid,
 		Domain:         dbEvent.Domain,
 		AggregateUuid:  dbEvent.AggregateUuid,
@@ -128,14 +130,15 @@ func BaseCommandToDbCommand(cmd comby.Command) (*Command, error) {
 	}
 
 	dbCmd := &Command{
-		InstanceId: cmd.GetInstanceId(),
-		Uuid:       cmd.GetCommandUuid(),
-		TenantUuid: cmd.GetTenantUuid(),
-		Domain:     cmd.GetDomain(),
-		CreatedAt:  cmd.GetCreatedAt(),
-		DataType:   dataType,
-		DataBytes:  string(cmdDataBytes),
-		ReqCtx:     string(reqCtxBytes),
+		InstanceId:    cmd.GetInstanceId(),
+		Uuid:          cmd.GetCommandUuid(),
+		TenantUuid:    cmd.GetTenantUuid(),
+		WorkspaceUuid: cmd.GetWorkspaceUuid(),
+		Domain:        cmd.GetDomain(),
+		CreatedAt:     cmd.GetCreatedAt(),
+		DataType:      dataType,
+		DataBytes:     string(cmdDataBytes),
+		ReqCtx:        string(reqCtxBytes),
 	}
 	return dbCmd, nil
 }
@@ -156,6 +159,7 @@ func DbCommandToBaseCommand(dbCmd *Command) (comby.Command, error) {
 		InstanceId:     dbCmd.InstanceId,
 		CommandUuid:    dbCmd.Uuid,
 		TenantUuid:     dbCmd.TenantUuid,
+		WorkspaceUuid:  dbCmd.WorkspaceUuid,
 		Domain:         dbCmd.Domain,
 		DomainCmdName:  dbCmd.DataType,
 		DomainCmdBytes: []byte(dbCmd.DataBytes),
