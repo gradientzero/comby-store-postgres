@@ -16,9 +16,18 @@ import (
 // Make sure it implements interfaces
 var _ comby.EventStore = (*eventStorePostgres)(nil)
 
+// pgQuerier abstracts *sql.DB and *sql.Tx so the same query code can run
+// with or without an RLS-scoped transaction wrapper.
+type pgQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 type eventStorePostgres struct {
 	options comby.EventStoreOptions
-	db      *sql.DB
+	db      *sql.DB // owner connection (BYPASSRLS)
+	appDb   *sql.DB // optional non-BYPASSRLS connection used for tenant-scoped ops; nil if RLS is off
 
 	// potgres specific options
 	host     string
@@ -45,18 +54,21 @@ func NewEventStorePostgres(host string, port int, user, password, dbName string,
 }
 
 func (es *eventStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
+	return es.connectAs(ctx, es.user, es.password)
+}
+
+func (es *eventStorePostgres) connectAs(ctx context.Context, user, password string) (*sql.DB, error) {
 	var dbNameStr string
 	var passwordStr string
 	dbName := es.dbName
 	if len(dbName) != 0 {
 		dbNameStr = fmt.Sprintf("dbname=%s", dbName)
 	}
-	pw := es.password
-	if len(pw) != 0 {
-		passwordStr = fmt.Sprintf("password=%s", pw)
+	if len(password) != 0 {
+		passwordStr = fmt.Sprintf("password=%s", password)
 	}
 	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s sslmode=disable",
-		es.host, es.port, es.user, passwordStr, dbNameStr)
+		es.host, es.port, user, passwordStr, dbNameStr)
 
 	// create postgres connection
 	db, err := sql.Open("postgres", dsn)
@@ -156,7 +168,7 @@ func (es *eventStorePostgres) Init(ctx context.Context, opts ...comby.EventStore
 		}
 	}
 
-	// connect to db (or create new one)
+	// connect to db (or create new one) as the owner role
 	if db, err := es.connect(ctx); err != nil {
 		return err
 	} else {
@@ -169,7 +181,52 @@ func (es *eventStorePostgres) Init(ctx context.Context, opts ...comby.EventStore
 			return err
 		}
 	}
+
+	// optional RLS app-role pool — only when EventStoreOptionWithRLSAppRole was set
+	if es.options.RLSAppRoleUser != "" {
+		// Ensure RLS policies are present on events/commands/snapshots.
+		// Idempotent.
+		if err := EnablePostgresRLS(ctx, es.db); err != nil {
+			return fmt.Errorf("eventStorePostgres.Init: EnablePostgresRLS failed: %w", err)
+		}
+		// Ensure the app role exists with NOBYPASSRLS + table grants.
+		if err := EnsureAppRole(ctx, es.db, es.options.RLSAppRoleUser, es.options.RLSAppRolePassword); err != nil {
+			return fmt.Errorf("eventStorePostgres.Init: EnsureAppRole failed: %w", err)
+		}
+		// Open the app-role pool.
+		if appDb, err := es.connectAs(ctx, es.options.RLSAppRoleUser, es.options.RLSAppRolePassword); err != nil {
+			return fmt.Errorf("eventStorePostgres.Init: app-role connect failed: %w", err)
+		} else {
+			es.appDb = appDb
+		}
+	}
 	return nil
+}
+
+// rlsEnabled reports whether the store has been configured with an RLS app
+// role and an active app-role pool.
+func (es *eventStorePostgres) rlsEnabled() bool {
+	return es.appDb != nil
+}
+
+// withTenantConn picks the correct connection pool and runs fn against it.
+//
+//   - If RLS is off, ctx is bypass-tagged, or tenantUuid is empty (cross-tenant
+//     query), fn runs on the owner pool (es.db) directly.
+//   - Otherwise fn runs on es.appDb inside a transaction whose
+//     app.tenant_uuid is set to tenantUuid via SET LOCAL. The RESTRICTIVE
+//     RLS policies on events/commands/snapshots then constrain reads and
+//     writes to that tenant.
+//
+// The fn callback receives a pgQuerier so it can use either *sql.DB or
+// *sql.Tx polymorphically.
+func (es *eventStorePostgres) withTenantConn(ctx context.Context, tenantUuid string, fn func(pgQuerier) error) error {
+	if !es.rlsEnabled() || comby.IsRLSBypass(ctx) || tenantUuid == "" {
+		return fn(es.db)
+	}
+	return WithRLSSession(ctx, es.appDb, tenantUuid, func(tx *sql.Tx) error {
+		return fn(tx)
+	})
 }
 
 func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventStoreCreateOption) error {
@@ -207,17 +264,6 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 		}
 	}
 
-	// sql begin transaction
-	tx, err := es.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
 	query := `INSERT INTO events (
 	instance_id,
 	uuid,
@@ -233,27 +279,25 @@ func (es *eventStorePostgres) Create(ctx context.Context, opts ...comby.EventSto
 	req_ctx
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12);`
 
-	_, err = tx.ExecContext(
-		ctx,
-		query,
-		dbRecord.InstanceId,
-		dbRecord.Uuid,
-		dbRecord.TenantUuid,
-		dbRecord.WorkspaceUuid,
-		dbRecord.CommandUuid,
-		dbRecord.Domain,
-		dbRecord.AggregateUuid,
-		dbRecord.Version,
-		dbRecord.CreatedAt,
-		dbRecord.DataType,
-		dbRecord.DataBytes,
-		dbRecord.ReqCtx,
-	)
-	if err != nil {
+	return es.withTenantConn(ctx, dbRecord.TenantUuid, func(q pgQuerier) error {
+		_, err := q.ExecContext(
+			ctx,
+			query,
+			dbRecord.InstanceId,
+			dbRecord.Uuid,
+			dbRecord.TenantUuid,
+			dbRecord.WorkspaceUuid,
+			dbRecord.CommandUuid,
+			dbRecord.Domain,
+			dbRecord.AggregateUuid,
+			dbRecord.Version,
+			dbRecord.CreatedAt,
+			dbRecord.DataType,
+			dbRecord.DataBytes,
+			dbRecord.ReqCtx,
+		)
 		return err
-	}
-
-	return tx.Commit()
+	})
 }
 
 func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreGetOption) (comby.Event, error) {
@@ -271,6 +315,9 @@ func (es *eventStorePostgres) Get(ctx context.Context, opts ...comby.EventStoreG
 	query := `SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), command_uuid, domain,
 		aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '')
 		FROM events WHERE uuid=$1 LIMIT 1;`
+
+	// Get-by-uuid has no tenant filter — must run on owner pool. Callers that
+	// need tenant scoping should use List(WithTenantUuid).
 	row := es.db.QueryRowContext(ctx, query, getOpts.EventUuid)
 	if row.Err() != nil {
 		return nil, row.Err()
@@ -386,23 +433,6 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 		}
 	}
 
-	// count the total number of records for this query
-	var queryTotal int64
-	var queryTotalQuery string = fmt.Sprintf("SELECT COUNT(id) FROM events%s;", whereSQL)
-	var row *sql.Row
-	if len(args) > 0 {
-		row = es.db.QueryRowContext(ctx, queryTotalQuery, args...)
-	} else {
-		row = es.db.QueryRowContext(ctx, queryTotalQuery)
-	}
-	if err := row.Err(); err != nil {
-		return nil, 0, err
-	}
-	// extract record
-	if err := row.Scan(&queryTotal); err != nil {
-		return nil, 0, err
-	}
-
 	// prepare orderby statement
 	var orderBySQL string = ""
 	if len(listOpts.OrderBy) > 0 {
@@ -423,53 +453,74 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 		offsetSQL = fmt.Sprintf(" OFFSET %d", listOpts.Offset)
 	}
 
-	// run query with parameterized values
+	// build queries
+	var queryTotalQuery string = fmt.Sprintf("SELECT COUNT(id) FROM events%s;", whereSQL)
 	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), command_uuid, domain, aggregate_uuid, version, created_at, data_type, data_bytes, COALESCE(req_ctx, '') FROM events%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
-	var rows *sql.Rows
-	var err error
-	if len(args) > 0 {
-		rows, err = es.db.QueryContext(ctx, query, args...)
-	} else {
-		rows, err = es.db.QueryContext(ctx, query)
-	}
-	switch {
-	case err == sql.ErrNoRows:
-		return nil, 0, nil
-	case err != nil:
-		return nil, 0, err
-	}
-	if rows != nil {
-		defer rows.Close()
-	}
 
-	// extract results
+	// route the count + list through the same connection. If TenantUuid is set,
+	// we run on the app pool with SET LOCAL app.tenant_uuid; otherwise on owner.
+	var queryTotal int64
 	var dbRecords []*internal.Event
-	for rows.Next() {
-		var dbRecord internal.Event
-		if err := rows.Scan(
-			&dbRecord.ID,
-			&dbRecord.InstanceId,
-			&dbRecord.Uuid,
-			&dbRecord.TenantUuid,
-			&dbRecord.WorkspaceUuid,
-			&dbRecord.CommandUuid,
-			&dbRecord.Domain,
-			&dbRecord.AggregateUuid,
-			&dbRecord.Version,
-			&dbRecord.CreatedAt,
-			&dbRecord.DataType,
-			&dbRecord.DataBytes,
-			&dbRecord.ReqCtx,
-		); err != nil {
-			return nil, 0, err
+	if rlsErr := es.withTenantConn(ctx, listOpts.TenantUuid, func(q pgQuerier) error {
+		// count
+		var row *sql.Row
+		if len(args) > 0 {
+			row = q.QueryRowContext(ctx, queryTotalQuery, args...)
+		} else {
+			row = q.QueryRowContext(ctx, queryTotalQuery)
 		}
-		dbRecords = append(dbRecords, &dbRecord)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, 0, err
-	}
-	if err = rows.Close(); err != nil {
-		return nil, 0, err
+		if err := row.Err(); err != nil {
+			return err
+		}
+		if err := row.Scan(&queryTotal); err != nil {
+			return err
+		}
+
+		// list
+		var rows *sql.Rows
+		var err error
+		if len(args) > 0 {
+			rows, err = q.QueryContext(ctx, query, args...)
+		} else {
+			rows, err = q.QueryContext(ctx, query)
+		}
+		switch {
+		case err == sql.ErrNoRows:
+			return nil
+		case err != nil:
+			return err
+		}
+		if rows != nil {
+			defer rows.Close()
+		}
+
+		for rows.Next() {
+			var dbRecord internal.Event
+			if err := rows.Scan(
+				&dbRecord.ID,
+				&dbRecord.InstanceId,
+				&dbRecord.Uuid,
+				&dbRecord.TenantUuid,
+				&dbRecord.WorkspaceUuid,
+				&dbRecord.CommandUuid,
+				&dbRecord.Domain,
+				&dbRecord.AggregateUuid,
+				&dbRecord.Version,
+				&dbRecord.CreatedAt,
+				&dbRecord.DataType,
+				&dbRecord.DataBytes,
+				&dbRecord.ReqCtx,
+			); err != nil {
+				return err
+			}
+			dbRecords = append(dbRecords, &dbRecord)
+		}
+		if err = rows.Err(); err != nil {
+			return err
+		}
+		return rows.Close()
+	}); rlsErr != nil {
+		return nil, 0, rlsErr
 	}
 
 	// decrypt domain data if crypto service is provided
@@ -486,7 +537,7 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 	if err != nil {
 		return nil, 0, err
 	}
-	return evts, queryTotal, err
+	return evts, queryTotal, nil
 }
 
 func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventStoreUpdateOption) error {
@@ -523,17 +574,6 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 		}
 	}
 
-	// sql begin transaction
-	tx, err := es.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
 	query := `UPDATE events SET
 		instance_id=$1,
 		tenant_uuid=$2,
@@ -548,25 +588,23 @@ func (es *eventStorePostgres) Update(ctx context.Context, opts ...comby.EventSto
 		req_ctx=$11
 	 WHERE uuid=$12;`
 
-	_, err = tx.ExecContext(ctx,
-		query,
-		dbRecord.InstanceId,
-		dbRecord.TenantUuid,
-		dbRecord.WorkspaceUuid,
-		dbRecord.CommandUuid,
-		dbRecord.Domain,
-		dbRecord.AggregateUuid,
-		dbRecord.Version,
-		dbRecord.CreatedAt,
-		dbRecord.DataType,
-		dbRecord.DataBytes,
-		dbRecord.ReqCtx,
-		dbRecord.Uuid)
-	if err != nil {
+	return es.withTenantConn(ctx, dbRecord.TenantUuid, func(q pgQuerier) error {
+		_, err := q.ExecContext(ctx,
+			query,
+			dbRecord.InstanceId,
+			dbRecord.TenantUuid,
+			dbRecord.WorkspaceUuid,
+			dbRecord.CommandUuid,
+			dbRecord.Domain,
+			dbRecord.AggregateUuid,
+			dbRecord.Version,
+			dbRecord.CreatedAt,
+			dbRecord.DataType,
+			dbRecord.DataBytes,
+			dbRecord.ReqCtx,
+			dbRecord.Uuid)
 		return err
-	}
-
-	return tx.Commit()
+	})
 }
 
 func (es *eventStorePostgres) Delete(ctx context.Context, opts ...comby.EventStoreDeleteOption) error {
@@ -585,7 +623,9 @@ func (es *eventStorePostgres) Delete(ctx context.Context, opts ...comby.EventSto
 		return fmt.Errorf("'%s' failed to delete event - event uuid '%s' is invalid", es.String(), eventUuid)
 	}
 
-	// run query with parameterized values
+	// run query with parameterized values. Delete-by-uuid has no tenant
+	// filter so it runs on the owner pool. Tenant-scoped admin tools should
+	// use a tenant-aware reset/delete-by-aggregate flow instead.
 	query := "DELETE FROM events WHERE uuid=$1;"
 	_, err := es.db.ExecContext(ctx, query, eventUuid)
 	return err
@@ -665,60 +705,62 @@ func (es *eventStorePostgres) UniqueList(ctx context.Context, opts ...comby.Even
 
 	// run query with parameterized values
 	var query string = fmt.Sprintf("SELECT DISTINCT %s FROM events%s%s%s%s;", listOpts.DbField, whereSQL, orderBySQL, limitSQL, offsetSQL)
-	var rows *sql.Rows
-	var err error
-	if len(args) > 0 {
-		rows, err = es.db.QueryContext(ctx, query, args...)
-	} else {
-		rows, err = es.db.QueryContext(ctx, query)
-	}
-	switch {
-	case err == sql.ErrNoRows:
-		return nil, 0, nil
-	case err != nil:
-		return nil, 0, err
-	}
-	if rows != nil {
-		defer rows.Close()
-	}
-
-	// extract results
-	var dbUniqueValues []string
-	for rows.Next() {
-		var dbUniqueValue string
-		if err := rows.Scan(&dbUniqueValue); err != nil {
-			return nil, 0, err
-		}
-		dbUniqueValues = append(dbUniqueValues, dbUniqueValue)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, 0, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, err
-	}
-
-	// run extra total query with parameterized values
 	var totalQuery string = fmt.Sprintf("SELECT COUNT(DISTINCT %s) FROM events%s;", listOpts.DbField, whereSQL)
-	var row *sql.Row
-	if len(args) > 0 {
-		row = es.db.QueryRowContext(ctx, totalQuery, args...)
-	} else {
-		row = es.db.QueryRowContext(ctx, totalQuery)
-	}
-	if err := row.Err(); err != nil {
-		return nil, 0, err
-	}
-	// extract record
+
+	var dbUniqueValues []string
 	var dbTotal int64
-	if err := row.Scan(&dbTotal); err != nil {
-		return nil, 0, err
+	if rlsErr := es.withTenantConn(ctx, listOpts.TenantUuid, func(q pgQuerier) error {
+		var rows *sql.Rows
+		var err error
+		if len(args) > 0 {
+			rows, err = q.QueryContext(ctx, query, args...)
+		} else {
+			rows, err = q.QueryContext(ctx, query)
+		}
+		switch {
+		case err == sql.ErrNoRows:
+			return nil
+		case err != nil:
+			return err
+		}
+		if rows != nil {
+			defer rows.Close()
+		}
+		for rows.Next() {
+			var v string
+			if err := rows.Scan(&v); err != nil {
+				return err
+			}
+			dbUniqueValues = append(dbUniqueValues, v)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		var row *sql.Row
+		if len(args) > 0 {
+			row = q.QueryRowContext(ctx, totalQuery, args...)
+		} else {
+			row = q.QueryRowContext(ctx, totalQuery)
+		}
+		if err := row.Err(); err != nil {
+			return err
+		}
+		return row.Scan(&dbTotal)
+	}); rlsErr != nil {
+		return nil, 0, rlsErr
 	}
 
 	return dbUniqueValues, dbTotal, nil
 }
 
 func (es *eventStorePostgres) Close(ctx context.Context) error {
+	if es.appDb != nil {
+		_ = es.appDb.Close()
+	}
 	return es.db.Close()
 }
 

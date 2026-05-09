@@ -34,36 +34,43 @@ import (
 // (via SET LOCAL) before each query. If unset, current_setting throws and
 // the RESTRICTIVE policy denies access (fail-closed).
 func EnablePostgresRLS(ctx context.Context, db *sql.DB) error {
+	// We use current_setting('app.tenant_uuid', true) — the second arg
+	// missing_ok=true makes current_setting return NULL when the GUC is
+	// not set, which makes the equality NULL (i.e., not true), and the
+	// RESTRICTIVE policy denies. Without missing_ok, current_setting
+	// raises an error on missing GUCs, which surfaces in unintuitive ways
+	// for Postgres clients that do not retry — fail-closed via a deny is
+	// cleaner.
 	stmts := []string{
 		// events
 		`ALTER TABLE events ENABLE ROW LEVEL SECURITY`,
 		`ALTER TABLE events FORCE ROW LEVEL SECURITY`,
 		`DROP POLICY IF EXISTS comby_tenant_isolation ON events`,
 		`CREATE POLICY comby_tenant_isolation ON events
-			AS RESTRICTIVE
+			AS PERMISSIVE
 			FOR ALL
-			USING (tenant_uuid = current_setting('app.tenant_uuid'))
-			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid'))`,
+			USING (tenant_uuid = current_setting('app.tenant_uuid', true))
+			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`,
 
 		// commands
 		`ALTER TABLE commands ENABLE ROW LEVEL SECURITY`,
 		`ALTER TABLE commands FORCE ROW LEVEL SECURITY`,
 		`DROP POLICY IF EXISTS comby_tenant_isolation ON commands`,
 		`CREATE POLICY comby_tenant_isolation ON commands
-			AS RESTRICTIVE
+			AS PERMISSIVE
 			FOR ALL
-			USING (tenant_uuid = current_setting('app.tenant_uuid'))
-			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid'))`,
+			USING (tenant_uuid = current_setting('app.tenant_uuid', true))
+			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`,
 
 		// snapshots
 		`ALTER TABLE snapshots ENABLE ROW LEVEL SECURITY`,
 		`ALTER TABLE snapshots FORCE ROW LEVEL SECURITY`,
 		`DROP POLICY IF EXISTS comby_tenant_isolation ON snapshots`,
 		`CREATE POLICY comby_tenant_isolation ON snapshots
-			AS RESTRICTIVE
+			AS PERMISSIVE
 			FOR ALL
-			USING (tenant_uuid = current_setting('app.tenant_uuid'))
-			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid'))`,
+			USING (tenant_uuid = current_setting('app.tenant_uuid', true))
+			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
@@ -124,4 +131,123 @@ func WithRLSSession(ctx context.Context, db *sql.DB, tenantUuid string, fn func(
 	}
 
 	return fn(tx)
+}
+
+// EnsureAppRole creates the given Postgres role if it does not exist and
+// grants the privileges the role needs to read/write the comby tables.
+// The role is created with NOBYPASSRLS so RESTRICTIVE policies actually apply.
+//
+// Idempotent: safe to call on every Init.
+//
+// The DDL is intentionally permissive on table grants (SELECT/INSERT/UPDATE/
+// DELETE on events, commands, snapshots) — RLS does the actual filtering.
+//
+// Role and password go into DDL fragments where parameterised SQL is not
+// supported, so we validate the role name is a safe identifier and quote the
+// password as a Postgres string literal.
+func EnsureAppRole(ctx context.Context, db *sql.DB, role, password string) error {
+	if role == "" {
+		return fmt.Errorf("EnsureAppRole: role name is required")
+	}
+	if !isSafePgIdentifier(role) {
+		return fmt.Errorf("EnsureAppRole: role name %q must match [A-Za-z_][A-Za-z0-9_]*", role)
+	}
+
+	qRole := pgQuoteIdent(role)
+	qPwd := pgQuoteLiteral(password)
+
+	// Probe existence
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)`, role).Scan(&exists); err != nil {
+		return fmt.Errorf("EnsureAppRole: probe existence: %w", err)
+	}
+
+	if !exists {
+		stmt := fmt.Sprintf(`CREATE ROLE %s LOGIN NOBYPASSRLS PASSWORD %s`, qRole, qPwd)
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("EnsureAppRole: CREATE ROLE failed: %w", err)
+		}
+	} else {
+		// Idempotent: enforce NOBYPASSRLS + LOGIN + (re)set password.
+		stmts := []string{
+			fmt.Sprintf(`ALTER ROLE %s NOBYPASSRLS LOGIN`, qRole),
+			fmt.Sprintf(`ALTER ROLE %s WITH PASSWORD %s`, qRole, qPwd),
+		}
+		for _, s := range stmts {
+			if _, err := db.ExecContext(ctx, s); err != nil {
+				return fmt.Errorf("EnsureAppRole: ALTER ROLE failed: %w", err)
+			}
+		}
+	}
+
+	// Grant privileges on tables. Tables must already exist — caller must run
+	// EnsureAppRole AFTER store Init has created them.
+	grants := []string{
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, qRole),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON events TO %s`, qRole),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON commands TO %s`, qRole),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO %s`, qRole),
+		fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s`, qRole),
+	}
+	for _, g := range grants {
+		if _, err := db.ExecContext(ctx, g); err != nil {
+			return fmt.Errorf("EnsureAppRole: %q: %w", g, err)
+		}
+	}
+	return nil
+}
+
+// isSafePgIdentifier reports whether s is a valid unquoted Postgres
+// identifier (letters/digits/underscore, not starting with a digit).
+// Conservative — rejects edge-cases like quoted identifiers.
+func isSafePgIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r == '_':
+			// ok
+		case r >= '0' && r <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// pgQuoteIdent quotes a Postgres identifier (role/table/column).
+// Doubles any embedded double-quote.
+func pgQuoteIdent(s string) string {
+	out := `"`
+	for _, r := range s {
+		if r == '"' {
+			out += `""`
+		} else {
+			out += string(r)
+		}
+	}
+	out += `"`
+	return out
+}
+
+// pgQuoteLiteral quotes a Postgres string literal. Doubles embedded single
+// quotes.
+func pgQuoteLiteral(s string) string {
+	out := "'"
+	for _, r := range s {
+		if r == '\'' {
+			out += "''"
+		} else {
+			out += string(r)
+		}
+	}
+	out += "'"
+	return out
 }

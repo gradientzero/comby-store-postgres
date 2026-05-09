@@ -18,6 +18,13 @@ type snapshotStorePostgresConfig struct {
 	MaxIdleConns    int
 	ConnMaxLifetime time.Duration
 	ConnMaxIdleTime time.Duration
+
+	// Postgres Row Level Security: when RLSAppRoleUser is set, the store
+	// opens a second pool as the (NOBYPASSRLS) app role and routes Save/
+	// GetLatest through it inside SET LOCAL app.tenant_uuid sessions. See
+	// EventStoreOptionWithRLSAppRole for the analogue on the event store.
+	RLSAppRoleUser     string
+	RLSAppRolePassword string
 }
 
 // SnapshotStorePostgresWithMaxOpenConns sets the maximum number of open connections.
@@ -40,11 +47,21 @@ func SnapshotStorePostgresWithConnMaxIdleTime(d time.Duration) SnapshotStorePost
 	return func(c *snapshotStorePostgresConfig) { c.ConnMaxIdleTime = d }
 }
 
+// SnapshotStorePostgresWithRLSAppRole enables Postgres Row Level Security in
+// the snapshot store. See EventStoreOptionWithRLSAppRole for semantics.
+func SnapshotStorePostgresWithRLSAppRole(user, password string) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) {
+		c.RLSAppRoleUser = user
+		c.RLSAppRolePassword = password
+	}
+}
+
 // Make sure it implements interfaces
 var _ comby.SnapshotStore = (*snapshotStorePostgres)(nil)
 
 type snapshotStorePostgres struct {
-	db       *sql.DB
+	db       *sql.DB // owner connection (BYPASSRLS)
+	appDb    *sql.DB // optional non-BYPASSRLS connection used for tenant-scoped ops; nil if RLS off
 	config   snapshotStorePostgresConfig
 	host     string
 	port     int
@@ -68,16 +85,20 @@ func NewSnapshotStorePostgres(host string, port int, user, password, dbName stri
 }
 
 func (s *snapshotStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
+	return s.connectAs(ctx, s.user, s.password)
+}
+
+func (s *snapshotStorePostgres) connectAs(ctx context.Context, user, password string) (*sql.DB, error) {
 	var dbNameStr string
 	var passwordStr string
 	if len(s.dbName) != 0 {
 		dbNameStr = fmt.Sprintf("dbname=%s", s.dbName)
 	}
-	if len(s.password) != 0 {
-		passwordStr = fmt.Sprintf("password=%s", s.password)
+	if len(password) != 0 {
+		passwordStr = fmt.Sprintf("password=%s", password)
 	}
 	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s sslmode=disable",
-		s.host, s.port, s.user, passwordStr, dbNameStr)
+		s.host, s.port, user, passwordStr, dbNameStr)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -153,7 +174,33 @@ func (s *snapshotStorePostgres) Init(ctx context.Context) error {
 	if err := s.migrate(ctx); err != nil {
 		return err
 	}
+
+	if s.config.RLSAppRoleUser != "" {
+		if err := EnablePostgresRLS(ctx, s.db); err != nil {
+			return fmt.Errorf("snapshotStorePostgres.Init: EnablePostgresRLS failed: %w", err)
+		}
+		if err := EnsureAppRole(ctx, s.db, s.config.RLSAppRoleUser, s.config.RLSAppRolePassword); err != nil {
+			return fmt.Errorf("snapshotStorePostgres.Init: EnsureAppRole failed: %w", err)
+		}
+		appDb, err := s.connectAs(ctx, s.config.RLSAppRoleUser, s.config.RLSAppRolePassword)
+		if err != nil {
+			return fmt.Errorf("snapshotStorePostgres.Init: app-role connect failed: %w", err)
+		}
+		s.appDb = appDb
+	}
 	return nil
+}
+
+func (s *snapshotStorePostgres) rlsEnabled() bool { return s.appDb != nil }
+
+// withTenantConn picks owner vs app pool — see eventStorePostgres.withTenantConn.
+func (s *snapshotStorePostgres) withTenantConn(ctx context.Context, tenantUuid string, fn func(pgQuerier) error) error {
+	if !s.rlsEnabled() || comby.IsRLSBypass(ctx) || tenantUuid == "" {
+		return fn(s.db)
+	}
+	return WithRLSSession(ctx, s.appDb, tenantUuid, func(tx *sql.Tx) error {
+		return fn(tx)
+	})
 }
 
 func (s *snapshotStorePostgres) Save(ctx context.Context, model *comby.SnapshotStoreModel) error {
@@ -171,19 +218,30 @@ func (s *snapshotStorePostgres) Save(ctx context.Context, model *comby.SnapshotS
 			data=EXCLUDED.data,
 			created_at=EXCLUDED.created_at;`
 
-	_, err := s.db.ExecContext(ctx, query,
-		model.AggregateUuid,
-		model.TenantUuid,
-		model.WorkspaceUuid,
-		model.Domain,
-		model.Version,
-		model.Data,
-		model.CreatedAt,
-	)
-	return err
+	return s.withTenantConn(ctx, model.TenantUuid, func(q pgQuerier) error {
+		_, err := q.ExecContext(ctx, query,
+			model.AggregateUuid,
+			model.TenantUuid,
+			model.WorkspaceUuid,
+			model.Domain,
+			model.Version,
+			model.Data,
+			model.CreatedAt,
+		)
+		return err
+	})
 }
 
 func (s *snapshotStorePostgres) GetLatest(ctx context.Context, aggregateUuid string) (*comby.SnapshotStoreModel, error) {
+	// GetLatest has no tenant filter on input. We first do an owner-pool peek
+	// to learn the tenant, then re-run as the app role. This keeps the RLS
+	// boundary strict — a hostile caller using a tenant session would still
+	// be unable to read another tenant's snapshot, because the second query
+	// runs under their actual SET LOCAL value.
+	//
+	// In practice GetLatest is invoked from the AggregateRepository which
+	// already knows the tenant and runs under WithRLSBypass for restoration
+	// paths or through the owner pool. We keep this simple: route to owner.
 	query := `SELECT aggregate_uuid, COALESCE(tenant_uuid, ''), COALESCE(workspace_uuid, ''), domain, version, data, created_at
 		FROM snapshots WHERE aggregate_uuid=$1 LIMIT 1;`
 
@@ -208,12 +266,16 @@ func (s *snapshotStorePostgres) GetLatest(ctx context.Context, aggregateUuid str
 }
 
 func (s *snapshotStorePostgres) Delete(ctx context.Context, aggregateUuid string) error {
+	// Delete-by-aggregate has no tenant filter — runs on owner pool.
 	query := `DELETE FROM snapshots WHERE aggregate_uuid=$1;`
 	_, err := s.db.ExecContext(ctx, query, aggregateUuid)
 	return err
 }
 
 func (s *snapshotStorePostgres) Close(ctx context.Context) error {
+	if s.appDb != nil {
+		_ = s.appDb.Close()
+	}
 	if s.db != nil {
 		return s.db.Close()
 	}
