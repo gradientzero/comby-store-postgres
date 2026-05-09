@@ -33,70 +33,115 @@ import (
 // The policies require the session variable app.tenant_uuid to be set
 // (via SET LOCAL) before each query. If unset, current_setting throws and
 // the RESTRICTIVE policy denies access (fail-closed).
-func EnablePostgresRLS(ctx context.Context, db *sql.DB) error {
-	// We use current_setting('app.tenant_uuid', true) — the second arg
-	// missing_ok=true makes current_setting return NULL when the GUC is
-	// not set, which makes the equality NULL (i.e., not true), and the
-	// RESTRICTIVE policy denies. Without missing_ok, current_setting
-	// raises an error on missing GUCs, which surfaces in unintuitive ways
-	// for Postgres clients that do not retry — fail-closed via a deny is
-	// cleaner.
+// rlsCombyTables lists the comby-managed tables that RLS applies to. Each
+// store enables RLS only for its own table via EnablePostgresRLSForTable,
+// so callers do not normally call EnablePostgresRLS directly — but the
+// helper remains available for ad-hoc enablement of all tables at once.
+var rlsCombyTables = []string{"events", "commands", "snapshots"}
+
+// EnablePostgresRLSForTable enables Row Level Security on a single comby
+// table and installs the comby_tenant_isolation policy. Idempotent.
+//
+// We use current_setting('app.tenant_uuid', true) — missing_ok=true makes
+// current_setting return NULL when the GUC is not set, the equality is
+// then NULL (i.e., not true), and the policy denies. Without missing_ok,
+// current_setting raises on missing GUCs, which surfaces in unintuitive
+// ways for clients that do not retry — fail-closed via a deny is cleaner.
+//
+// PERMISSIVE (not RESTRICTIVE): Postgres applies default-deny unless at
+// least one PERMISSIVE policy allows. A standalone RESTRICTIVE policy
+// denies everything.
+//
+// Returns an error if the table does not exist. Use tableExists() if you
+// want a soft check.
+func EnablePostgresRLSForTable(ctx context.Context, db *sql.DB, table string) error {
+	if !isSafePgIdentifier(table) {
+		return fmt.Errorf("EnablePostgresRLSForTable: table %q must match [A-Za-z_][A-Za-z0-9_]*", table)
+	}
+	q := pgQuoteIdent(table)
 	stmts := []string{
-		// events
-		`ALTER TABLE events ENABLE ROW LEVEL SECURITY`,
-		`ALTER TABLE events FORCE ROW LEVEL SECURITY`,
-		`DROP POLICY IF EXISTS comby_tenant_isolation ON events`,
-		`CREATE POLICY comby_tenant_isolation ON events
+		fmt.Sprintf(`ALTER TABLE %s ENABLE ROW LEVEL SECURITY`, q),
+		fmt.Sprintf(`ALTER TABLE %s FORCE ROW LEVEL SECURITY`, q),
+		fmt.Sprintf(`DROP POLICY IF EXISTS comby_tenant_isolation ON %s`, q),
+		fmt.Sprintf(`CREATE POLICY comby_tenant_isolation ON %s
 			AS PERMISSIVE
 			FOR ALL
 			USING (tenant_uuid = current_setting('app.tenant_uuid', true))
-			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`,
-
-		// commands
-		`ALTER TABLE commands ENABLE ROW LEVEL SECURITY`,
-		`ALTER TABLE commands FORCE ROW LEVEL SECURITY`,
-		`DROP POLICY IF EXISTS comby_tenant_isolation ON commands`,
-		`CREATE POLICY comby_tenant_isolation ON commands
-			AS PERMISSIVE
-			FOR ALL
-			USING (tenant_uuid = current_setting('app.tenant_uuid', true))
-			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`,
-
-		// snapshots
-		`ALTER TABLE snapshots ENABLE ROW LEVEL SECURITY`,
-		`ALTER TABLE snapshots FORCE ROW LEVEL SECURITY`,
-		`DROP POLICY IF EXISTS comby_tenant_isolation ON snapshots`,
-		`CREATE POLICY comby_tenant_isolation ON snapshots
-			AS PERMISSIVE
-			FOR ALL
-			USING (tenant_uuid = current_setting('app.tenant_uuid', true))
-			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`,
+			WITH CHECK (tenant_uuid = current_setting('app.tenant_uuid', true))`, q),
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("EnablePostgresRLS failed at %q: %w", stmt, err)
+			return fmt.Errorf("EnablePostgresRLSForTable(%s): %w", table, err)
 		}
 	}
 	return nil
 }
 
-// DisablePostgresRLS removes RLS policies and disables RLS on all comby tables.
-// Useful for diagnostics and migrations. Do not run in production unless intended.
-func DisablePostgresRLS(ctx context.Context, db *sql.DB) error {
-	stmts := []string{
-		`DROP POLICY IF EXISTS comby_tenant_isolation ON events`,
-		`DROP POLICY IF EXISTS comby_tenant_isolation ON commands`,
-		`DROP POLICY IF EXISTS comby_tenant_isolation ON snapshots`,
-		`ALTER TABLE events DISABLE ROW LEVEL SECURITY`,
-		`ALTER TABLE commands DISABLE ROW LEVEL SECURITY`,
-		`ALTER TABLE snapshots DISABLE ROW LEVEL SECURITY`,
-	}
-	for _, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("DisablePostgresRLS failed at %q: %w", stmt, err)
+// EnablePostgresRLS enables RLS on all comby-managed tables that exist.
+// Tables that don't exist yet are skipped — callers that want to ensure
+// every table is covered should run their store Init first. Idempotent.
+func EnablePostgresRLS(ctx context.Context, db *sql.DB) error {
+	for _, table := range rlsCombyTables {
+		exists, err := tableExists(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("EnablePostgresRLS: probe %s: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
+		if err := EnablePostgresRLSForTable(ctx, db, table); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// DisablePostgresRLSForTable removes the comby policy and disables RLS on
+// a single table. Idempotent.
+func DisablePostgresRLSForTable(ctx context.Context, db *sql.DB, table string) error {
+	if !isSafePgIdentifier(table) {
+		return fmt.Errorf("DisablePostgresRLSForTable: table %q must match [A-Za-z_][A-Za-z0-9_]*", table)
+	}
+	q := pgQuoteIdent(table)
+	stmts := []string{
+		fmt.Sprintf(`DROP POLICY IF EXISTS comby_tenant_isolation ON %s`, q),
+		fmt.Sprintf(`ALTER TABLE %s DISABLE ROW LEVEL SECURITY`, q),
+	}
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("DisablePostgresRLSForTable(%s): %w", table, err)
+		}
+	}
+	return nil
+}
+
+// DisablePostgresRLS removes policies and disables RLS on all comby tables
+// that exist. Skips missing tables. Don't run in production unless intended.
+func DisablePostgresRLS(ctx context.Context, db *sql.DB) error {
+	for _, table := range rlsCombyTables {
+		exists, err := tableExists(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("DisablePostgresRLS: probe %s: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
+		if err := DisablePostgresRLSForTable(ctx, db, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tableExists reports whether the given table exists in the public schema.
+func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
+	var exists bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=$1)`, table,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // WithRLSSession runs fn inside a transaction that has app.tenant_uuid set
@@ -181,18 +226,27 @@ func EnsureAppRole(ctx context.Context, db *sql.DB, role, password string) error
 		}
 	}
 
-	// Grant privileges on tables. Tables must already exist — caller must run
-	// EnsureAppRole AFTER store Init has created them.
-	grants := []string{
-		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, qRole),
-		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON events TO %s`, qRole),
-		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON commands TO %s`, qRole),
-		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON snapshots TO %s`, qRole),
-		fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s`, qRole),
+	// Schema-level grants
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, qRole)); err != nil {
+		return fmt.Errorf("EnsureAppRole: GRANT USAGE: %w", err)
 	}
-	for _, g := range grants {
-		if _, err := db.ExecContext(ctx, g); err != nil {
-			return fmt.Errorf("EnsureAppRole: %q: %w", g, err)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s`, qRole)); err != nil {
+		return fmt.Errorf("EnsureAppRole: GRANT SEQUENCES: %w", err)
+	}
+
+	// Per-table grants — skip tables that haven't been created yet so the
+	// helper can be called from any store's Init in any order.
+	for _, table := range rlsCombyTables {
+		exists, err := tableExists(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("EnsureAppRole: probe %s: %w", table, err)
+		}
+		if !exists {
+			continue
+		}
+		stmt := fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s`, pgQuoteIdent(table), qRole)
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("EnsureAppRole: %q: %w", stmt, err)
 		}
 	}
 	return nil

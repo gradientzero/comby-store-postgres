@@ -176,8 +176,8 @@ func (s *snapshotStorePostgres) Init(ctx context.Context) error {
 	}
 
 	if s.config.RLSAppRoleUser != "" {
-		if err := EnablePostgresRLS(ctx, s.db); err != nil {
-			return fmt.Errorf("snapshotStorePostgres.Init: EnablePostgresRLS failed: %w", err)
+		if err := EnablePostgresRLSForTable(ctx, s.db, "snapshots"); err != nil {
+			return fmt.Errorf("snapshotStorePostgres.Init: EnablePostgresRLSForTable failed: %w", err)
 		}
 		if err := EnsureAppRole(ctx, s.db, s.config.RLSAppRoleUser, s.config.RLSAppRolePassword); err != nil {
 			return fmt.Errorf("snapshotStorePostgres.Init: EnsureAppRole failed: %w", err)

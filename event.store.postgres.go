@@ -184,10 +184,11 @@ func (es *eventStorePostgres) Init(ctx context.Context, opts ...comby.EventStore
 
 	// optional RLS app-role pool — only when EventStoreOptionWithRLSAppRole was set
 	if es.options.RLSAppRoleUser != "" {
-		// Ensure RLS policies are present on events/commands/snapshots.
+		// Ensure RLS policy is present on the events table only — Command/
+		// Snapshot stores enable RLS for their own tables independently.
 		// Idempotent.
-		if err := EnablePostgresRLS(ctx, es.db); err != nil {
-			return fmt.Errorf("eventStorePostgres.Init: EnablePostgresRLS failed: %w", err)
+		if err := EnablePostgresRLSForTable(ctx, es.db, "events"); err != nil {
+			return fmt.Errorf("eventStorePostgres.Init: EnablePostgresRLSForTable failed: %w", err)
 		}
 		// Ensure the app role exists with NOBYPASSRLS + table grants.
 		if err := EnsureAppRole(ctx, es.db, es.options.RLSAppRoleUser, es.options.RLSAppRolePassword); err != nil {

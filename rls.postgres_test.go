@@ -157,9 +157,10 @@ func TestRLS_OffPathBackwardsCompat(t *testing.T) {
 // Test 2: Init with RLS option provisions the role and policies
 // ============================================================================
 
-// TestRLS_InitProvisionsAppRoleAndPolicies: after Init with WithRLSAppRole,
-// the events/commands/snapshots tables have RLS enabled and the comby_app
-// role exists with NOBYPASSRLS.
+// TestRLS_InitProvisionsAppRoleAndPolicies: after EventStore.Init with
+// WithRLSAppRole, the events table has RLS enabled and the comby_app role
+// exists with NOBYPASSRLS. Each store provisions RLS only for its own
+// table — see Test 8 for the symmetric coverage of all three tables.
 func TestRLS_InitProvisionsAppRoleAndPolicies(t *testing.T) {
 	owner := rlsOwnerDB(t)
 	defer owner.Close()
@@ -169,35 +170,82 @@ func TestRLS_InitProvisionsAppRoleAndPolicies(t *testing.T) {
 	es := makeRLSEventStore(t)
 	defer es.Close(context.Background())
 
-	// RLS enabled on events
-	for _, table := range []string{"events", "commands", "snapshots"} {
-		var rels, forced bool
-		row := owner.QueryRow(`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname=$1`, table)
-		if err := row.Scan(&rels, &forced); err != nil {
-			t.Fatalf("table %s pg_class: %v", table, err)
-		}
-		if !rels {
-			t.Fatalf("expected RLS enabled on %s", table)
-		}
-		if !forced {
-			t.Fatalf("expected RLS FORCED on %s", table)
-		}
-		// Policy exists?
-		var policyName string
-		row = owner.QueryRow(`SELECT policyname FROM pg_policies WHERE tablename=$1 AND policyname='comby_tenant_isolation'`, table)
-		if err := row.Scan(&policyName); err != nil {
-			t.Fatalf("table %s missing comby_tenant_isolation policy: %v", table, err)
-		}
+	// RLS enabled on the events table created by this store
+	var rels, forced bool
+	row := owner.QueryRow(`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname='events'`)
+	if err := row.Scan(&rels, &forced); err != nil {
+		t.Fatalf("events pg_class: %v", err)
+	}
+	if !rels {
+		t.Fatal("expected RLS enabled on events")
+	}
+	if !forced {
+		t.Fatal("expected RLS FORCED on events")
+	}
+	// Policy exists?
+	var policyName string
+	row = owner.QueryRow(`SELECT policyname FROM pg_policies WHERE tablename='events' AND policyname='comby_tenant_isolation'`)
+	if err := row.Scan(&policyName); err != nil {
+		t.Fatalf("events missing comby_tenant_isolation policy: %v", err)
 	}
 
 	// app role exists, NOBYPASSRLS
 	var rolBypassRLS bool
-	row := owner.QueryRow(`SELECT rolbypassrls FROM pg_roles WHERE rolname=$1`, rlsTestAppRole)
+	row = owner.QueryRow(`SELECT rolbypassrls FROM pg_roles WHERE rolname=$1`, rlsTestAppRole)
 	if err := row.Scan(&rolBypassRLS); err != nil {
 		t.Fatalf("app role %q missing: %v", rlsTestAppRole, err)
 	}
 	if rolBypassRLS {
 		t.Fatalf("expected app role %q to be NOBYPASSRLS, got BYPASSRLS=true", rlsTestAppRole)
+	}
+}
+
+// TestRLS_PerStoreInitIsScoped: each store's Init must enable RLS only for
+// its own table. Initialising EventStore alone must NOT fail because
+// commands/snapshots tables don't exist yet, and must NOT enable RLS on
+// any table other than events.
+func TestRLS_PerStoreInitIsScoped(t *testing.T) {
+	owner := rlsOwnerDB(t)
+	defer owner.Close()
+
+	// Drop all three tables so we can prove EventStore.Init alone succeeds.
+	if _, err := owner.Exec(`DROP TABLE IF EXISTS events, commands, snapshots CASCADE`); err != nil {
+		t.Fatalf("drop tables: %v", err)
+	}
+	t.Cleanup(func() { rlsResetState(t, owner) })
+
+	es := makeRLSEventStore(t)
+	defer es.Close(context.Background())
+
+	// events should have RLS, commands+snapshots should not even exist
+	for _, c := range []struct {
+		name       string
+		mustExist  bool
+		mustHaveRLS bool
+	}{
+		{"events", true, true},
+		{"commands", false, false},
+		{"snapshots", false, false},
+	} {
+		var exists bool
+		if err := owner.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=$1)`, c.name,
+		).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != c.mustExist {
+			t.Fatalf("table %s exists=%v want=%v", c.name, exists, c.mustExist)
+		}
+		if !exists {
+			continue
+		}
+		var rels bool
+		if err := owner.QueryRow(`SELECT relrowsecurity FROM pg_class WHERE relname=$1`, c.name).Scan(&rels); err != nil {
+			t.Fatal(err)
+		}
+		if rels != c.mustHaveRLS {
+			t.Fatalf("table %s rls=%v want=%v", c.name, rels, c.mustHaveRLS)
+		}
 	}
 }
 
@@ -497,6 +545,18 @@ func TestRLS_AppliesToAllThreeTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ss.Close(ctx)
+
+	// After all three stores Init, all three tables must have RLS enabled.
+	for _, table := range []string{"events", "commands", "snapshots"} {
+		var rels, forced bool
+		row := owner.QueryRow(`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname=$1`, table)
+		if err := row.Scan(&rels, &forced); err != nil {
+			t.Fatalf("table %s pg_class: %v", table, err)
+		}
+		if !rels || !forced {
+			t.Fatalf("expected RLS enabled+forced on %s, got rels=%v forced=%v", table, rels, forced)
+		}
+	}
 
 	tenantA := comby.NewUuid()
 	tenantB := comby.NewUuid()

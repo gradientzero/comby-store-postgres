@@ -163,8 +163,8 @@ func (cs *commandStorePostgres) Init(ctx context.Context, opts ...comby.CommandS
 
 	// optional RLS app-role pool
 	if cs.options.RLSAppRoleUser != "" {
-		if err := EnablePostgresRLS(ctx, cs.db); err != nil {
-			return fmt.Errorf("commandStorePostgres.Init: EnablePostgresRLS failed: %w", err)
+		if err := EnablePostgresRLSForTable(ctx, cs.db, "commands"); err != nil {
+			return fmt.Errorf("commandStorePostgres.Init: EnablePostgresRLSForTable failed: %w", err)
 		}
 		if err := EnsureAppRole(ctx, cs.db, cs.options.RLSAppRoleUser, cs.options.RLSAppRolePassword); err != nil {
 			return fmt.Errorf("commandStorePostgres.Init: EnsureAppRole failed: %w", err)
