@@ -165,6 +165,11 @@ func (s *snapshotStorePostgres) migrate(ctx context.Context) error {
 }
 
 func (s *snapshotStorePostgres) Init(ctx context.Context) error {
+	// Idempotent re-init — see comment in eventStorePostgres.Init.
+	if s.db != nil {
+		return nil
+	}
+
 	db, err := s.connect(ctx)
 	if err != nil {
 		return err

@@ -168,6 +168,16 @@ func (es *eventStorePostgres) Init(ctx context.Context, opts ...comby.EventStore
 		}
 	}
 
+	// Idempotent re-init: if the owner pool is already open, the second call
+	// just merges any new options and returns. Without this, callers that
+	// pass the same store handle through both NewEventStorePostgres options
+	// AND a follow-up Init (e.g. comby.NewFacade auto-inits its registered
+	// stores) would open a brand-new connection pool every time, leaking the
+	// previous one and quickly exhausting Postgres' connection budget.
+	if es.db != nil {
+		return nil
+	}
+
 	// connect to db (or create new one) as the owner role
 	if db, err := es.connect(ctx); err != nil {
 		return err

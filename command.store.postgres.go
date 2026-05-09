@@ -147,6 +147,11 @@ func (cs *commandStorePostgres) Init(ctx context.Context, opts ...comby.CommandS
 		}
 	}
 
+	// Idempotent re-init — see comment in eventStorePostgres.Init.
+	if cs.db != nil {
+		return nil
+	}
+
 	// connect to db as owner (BYPASSRLS)
 	if db, err := cs.connect(ctx); err != nil {
 		return err
