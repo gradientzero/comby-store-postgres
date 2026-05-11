@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	store "github.com/gradientzero/comby-store-postgres"
-	"github.com/gradientzero/comby/v2"
+	"github.com/gradientzero/comby/v3"
 )
 
 func newSnapshotStorePostgres(t *testing.T) comby.SnapshotStore {

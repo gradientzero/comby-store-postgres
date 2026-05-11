@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gradientzero/comby-store-postgres/internal"
-	"github.com/gradientzero/comby/v2"
+	"github.com/gradientzero/comby/v3"
 	_ "github.com/lib/pq"
 )
 
@@ -18,7 +18,8 @@ var _ comby.CommandStore = (*commandStorePostgres)(nil)
 
 type commandStorePostgres struct {
 	options comby.CommandStoreOptions
-	db      *sql.DB
+	db      *sql.DB // owner connection (BYPASSRLS)
+	appDb   *sql.DB // optional non-BYPASSRLS connection used for tenant-scoped ops; nil if RLS is off
 
 	// potgres specific options
 	host     string
@@ -45,19 +46,21 @@ func NewCommandStorePostgres(host string, port int, user, password, dbName strin
 }
 
 func (cs *commandStorePostgres) connect(ctx context.Context) (*sql.DB, error) {
+	return cs.connectAs(ctx, cs.user, cs.password)
+}
 
+func (cs *commandStorePostgres) connectAs(ctx context.Context, user, password string) (*sql.DB, error) {
 	var dbNameStr string
 	var passwordStr string
 	dbName := cs.dbName
 	if len(dbName) != 0 {
 		dbNameStr = fmt.Sprintf("dbname=%s", dbName)
 	}
-	pw := cs.password
-	if len(pw) != 0 {
-		passwordStr = fmt.Sprintf("password=%s", pw)
+	if len(password) != 0 {
+		passwordStr = fmt.Sprintf("password=%s", password)
 	}
 	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s sslmode=disable",
-		cs.host, cs.port, cs.user, passwordStr, dbNameStr)
+		cs.host, cs.port, user, passwordStr, dbNameStr)
 
 	// create postgres connection
 	db, err := sql.Open("postgres", dsn)
@@ -106,6 +109,7 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 		instance_id INTEGER,
 		uuid TEXT,
 		tenant_uuid TEXT,
+		workspace_uuid TEXT,
 		domain TEXT,
 		created_at BIGINT,
 		data_type TEXT,
@@ -115,6 +119,9 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS "tenant_index" ON "commands" (
 		"tenant_uuid" ASC
 	);
+	CREATE INDEX IF NOT EXISTS "workspace_index" ON "commands" (
+		"workspace_uuid" ASC
+	);
 	CREATE UNIQUE INDEX IF NOT EXISTS "cmd_uuid_index" ON "commands" (
 		"uuid" ASC
 	);
@@ -122,8 +129,14 @@ func (cs *commandStorePostgres) migrate(ctx context.Context) error {
 		"created_at" ASC
 	);
 	`
-	_, err := cs.db.ExecContext(ctx, query)
-	return err
+	if _, err := cs.db.ExecContext(ctx, query); err != nil {
+		return err
+	}
+	// migrate existing databases: add workspace_uuid column if it doesn't exist
+	if _, err := cs.db.ExecContext(ctx, `ALTER TABLE commands ADD COLUMN IF NOT EXISTS workspace_uuid TEXT`); err != nil {
+		return err
+	}
+	return nil
 }
 
 // fullfilling CommandStore interface
@@ -134,7 +147,12 @@ func (cs *commandStorePostgres) Init(ctx context.Context, opts ...comby.CommandS
 		}
 	}
 
-	// connect to db (or create new one)
+	// Idempotent re-init — see comment in eventStorePostgres.Init.
+	if cs.db != nil {
+		return nil
+	}
+
+	// connect to db as owner (BYPASSRLS)
 	if db, err := cs.connect(ctx); err != nil {
 		return err
 	} else {
@@ -148,7 +166,34 @@ func (cs *commandStorePostgres) Init(ctx context.Context, opts ...comby.CommandS
 		}
 	}
 
+	// optional RLS app-role pool
+	if cs.options.RLSAppRoleUser != "" {
+		if err := EnablePostgresRLSForTable(ctx, cs.db, "commands"); err != nil {
+			return fmt.Errorf("commandStorePostgres.Init: EnablePostgresRLSForTable failed: %w", err)
+		}
+		if err := EnsureAppRole(ctx, cs.db, cs.options.RLSAppRoleUser, cs.options.RLSAppRolePassword); err != nil {
+			return fmt.Errorf("commandStorePostgres.Init: EnsureAppRole failed: %w", err)
+		}
+		if appDb, err := cs.connectAs(ctx, cs.options.RLSAppRoleUser, cs.options.RLSAppRolePassword); err != nil {
+			return fmt.Errorf("commandStorePostgres.Init: app-role connect failed: %w", err)
+		} else {
+			cs.appDb = appDb
+		}
+	}
+
 	return nil
+}
+
+func (cs *commandStorePostgres) rlsEnabled() bool { return cs.appDb != nil }
+
+// withTenantConn picks owner vs app pool — see eventStorePostgres.withTenantConn.
+func (cs *commandStorePostgres) withTenantConn(ctx context.Context, tenantUuid string, fn func(pgQuerier) error) error {
+	if !cs.rlsEnabled() || comby.IsRLSBypass(ctx) || tenantUuid == "" {
+		return fn(cs.db)
+	}
+	return WithRLSSession(ctx, cs.appDb, tenantUuid, func(tx *sql.Tx) error {
+		return fn(tx)
+	})
 }
 
 func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.CommandStoreCreateOption) error {
@@ -184,45 +229,34 @@ func (cs *commandStorePostgres) Create(ctx context.Context, opts ...comby.Comman
 		}
 	}
 
-	// sql begin transaction
-	tx, err := cs.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
 	query := `INSERT INTO commands (
 		instance_id,
 		uuid,
 		tenant_uuid,
+		workspace_uuid,
 		domain,
 		created_at,
 		data_type,
 		data_bytes,
 		req_ctx
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8);`
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9);`
 
-	_, err = tx.ExecContext(
-		ctx,
-		query,
-		dbRecord.InstanceId,
-		dbRecord.Uuid,
-		dbRecord.TenantUuid,
-		dbRecord.Domain,
-		dbRecord.CreatedAt,
-		dbRecord.DataType,
-		dbRecord.DataBytes,
-		dbRecord.ReqCtx,
-	)
-	if err != nil {
+	return cs.withTenantConn(ctx, dbRecord.TenantUuid, func(q pgQuerier) error {
+		_, err := q.ExecContext(
+			ctx,
+			query,
+			dbRecord.InstanceId,
+			dbRecord.Uuid,
+			dbRecord.TenantUuid,
+			dbRecord.WorkspaceUuid,
+			dbRecord.Domain,
+			dbRecord.CreatedAt,
+			dbRecord.DataType,
+			dbRecord.DataBytes,
+			dbRecord.ReqCtx,
+		)
 		return err
-	}
-
-	return tx.Commit()
+	})
 }
 
 func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandStoreGetOption) (comby.Command, error) {
@@ -237,7 +271,7 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 		return nil, fmt.Errorf("'%s' failed to get command - command uuid is required", cs.String())
 	}
 
-	query := `SELECT id, instance_id, uuid, tenant_uuid, domain,
+	query := `SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), domain,
 		created_at, data_type, data_bytes, req_ctx
 		FROM commands WHERE uuid=$1 LIMIT 1;`
 	row := cs.db.QueryRowContext(ctx, query, getOpts.CommandUuid)
@@ -252,6 +286,7 @@ func (cs *commandStorePostgres) Get(ctx context.Context, opts ...comby.CommandSt
 		&dbRecord.InstanceId,
 		&dbRecord.Uuid,
 		&dbRecord.TenantUuid,
+		&dbRecord.WorkspaceUuid,
 		&dbRecord.Domain,
 		&dbRecord.CreatedAt,
 		&dbRecord.DataType,
@@ -333,23 +368,6 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 		whereSQL = " WHERE " + strings.Join(whereList, " AND ")
 	}
 
-	// count the total number of records for this query
-	var queryTotal int64
-	var queryTotalQuery string = fmt.Sprintf("SELECT COUNT(id) FROM commands%s;", whereSQL)
-	var row *sql.Row
-	if len(args) > 0 {
-		row = cs.db.QueryRowContext(ctx, queryTotalQuery, args...)
-	} else {
-		row = cs.db.QueryRowContext(ctx, queryTotalQuery)
-	}
-	if err := row.Err(); err != nil {
-		return nil, 0, err
-	}
-	// extract record
-	if err := row.Scan(&queryTotal); err != nil {
-		return nil, 0, err
-	}
-
 	// prepare orderby
 	var orderBySQL string = ""
 	if len(listOpts.OrderBy) > 0 {
@@ -370,49 +388,65 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 		offsetSQL = fmt.Sprintf(" OFFSET %d", listOpts.Offset)
 	}
 
-	// run query with parameterized values
-	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, domain, created_at, data_type, data_bytes, req_ctx FROM commands%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
-	var rows *sql.Rows
-	var err error
-	if len(args) > 0 {
-		rows, err = cs.db.QueryContext(ctx, query, args...)
-	} else {
-		rows, err = cs.db.QueryContext(ctx, query)
-	}
-	switch {
-	case err == sql.ErrNoRows:
-		return nil, queryTotal, nil
-	case err != nil:
-		return nil, 0, err
-	}
-	if rows != nil {
-		defer rows.Close()
-	}
+	var queryTotalQuery string = fmt.Sprintf("SELECT COUNT(id) FROM commands%s;", whereSQL)
+	var query string = fmt.Sprintf("SELECT id, instance_id, uuid, tenant_uuid, COALESCE(workspace_uuid, ''), domain, created_at, data_type, data_bytes, req_ctx FROM commands%s%s%s%s;", whereSQL, orderBySQL, limitSQL, offsetSQL)
 
-	// extract results
+	var queryTotal int64
 	var dbRecords []*internal.Command
-	for rows.Next() {
-		var dbRecord internal.Command
-		if err := rows.Scan(
-			&dbRecord.ID,
-			&dbRecord.InstanceId,
-			&dbRecord.Uuid,
-			&dbRecord.TenantUuid,
-			&dbRecord.Domain,
-			&dbRecord.CreatedAt,
-			&dbRecord.DataType,
-			&dbRecord.DataBytes,
-			&dbRecord.ReqCtx,
-		); err != nil {
-			return nil, 0, err
+	if rlsErr := cs.withTenantConn(ctx, listOpts.TenantUuid, func(q pgQuerier) error {
+		var row *sql.Row
+		if len(args) > 0 {
+			row = q.QueryRowContext(ctx, queryTotalQuery, args...)
+		} else {
+			row = q.QueryRowContext(ctx, queryTotalQuery)
 		}
-		dbRecords = append(dbRecords, &dbRecord)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, 0, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, err
+		if err := row.Err(); err != nil {
+			return err
+		}
+		if err := row.Scan(&queryTotal); err != nil {
+			return err
+		}
+
+		var rows *sql.Rows
+		var err error
+		if len(args) > 0 {
+			rows, err = q.QueryContext(ctx, query, args...)
+		} else {
+			rows, err = q.QueryContext(ctx, query)
+		}
+		switch {
+		case err == sql.ErrNoRows:
+			return nil
+		case err != nil:
+			return err
+		}
+		if rows != nil {
+			defer rows.Close()
+		}
+		for rows.Next() {
+			var dbRecord internal.Command
+			if err := rows.Scan(
+				&dbRecord.ID,
+				&dbRecord.InstanceId,
+				&dbRecord.Uuid,
+				&dbRecord.TenantUuid,
+				&dbRecord.WorkspaceUuid,
+				&dbRecord.Domain,
+				&dbRecord.CreatedAt,
+				&dbRecord.DataType,
+				&dbRecord.DataBytes,
+				&dbRecord.ReqCtx,
+			); err != nil {
+				return err
+			}
+			dbRecords = append(dbRecords, &dbRecord)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		return rows.Err()
+	}); rlsErr != nil {
+		return nil, 0, rlsErr
 	}
 
 	// decrypt domain data if crypto service is provided
@@ -424,12 +458,11 @@ func (cs *commandStorePostgres) List(ctx context.Context, opts ...comby.CommandS
 		}
 	}
 
-	// convert
 	cmds, err := internal.DbCommandsToBaseCommands(dbRecords)
 	if err != nil {
 		return nil, 0, err
 	}
-	return cmds, queryTotal, err
+	return cmds, queryTotal, nil
 }
 
 func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.CommandStoreUpdateOption) error {
@@ -465,42 +498,31 @@ func (cs *commandStorePostgres) Update(ctx context.Context, opts ...comby.Comman
 		}
 	}
 
-	// sql begin transaction
-	tx, err := cs.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
-
 	query := `UPDATE commands SET
 		instance_id=$1,
 		tenant_uuid=$2,
-		domain=$3,
-		created_at=$4,
-		data_type=$5,
-		data_bytes=$6,
-		req_ctx=$7
-	 WHERE uuid=$8;`
+		workspace_uuid=$3,
+		domain=$4,
+		created_at=$5,
+		data_type=$6,
+		data_bytes=$7,
+		req_ctx=$8
+	 WHERE uuid=$9;`
 
-	_, err = tx.ExecContext(ctx,
-		query,
-		dbRecord.InstanceId,
-		dbRecord.TenantUuid,
-		dbRecord.Domain,
-		dbRecord.CreatedAt,
-		dbRecord.DataType,
-		dbRecord.DataBytes,
-		dbRecord.ReqCtx,
-		dbRecord.Uuid)
-	if err != nil {
+	return cs.withTenantConn(ctx, dbRecord.TenantUuid, func(q pgQuerier) error {
+		_, err := q.ExecContext(ctx,
+			query,
+			dbRecord.InstanceId,
+			dbRecord.TenantUuid,
+			dbRecord.WorkspaceUuid,
+			dbRecord.Domain,
+			dbRecord.CreatedAt,
+			dbRecord.DataType,
+			dbRecord.DataBytes,
+			dbRecord.ReqCtx,
+			dbRecord.Uuid)
 		return err
-	}
-
-	return tx.Commit()
+	})
 }
 
 func (cs *commandStorePostgres) Delete(ctx context.Context, opts ...comby.CommandStoreDeleteOption) error {
@@ -539,6 +561,9 @@ func (cs *commandStorePostgres) Total(ctx context.Context) int64 {
 }
 
 func (cs *commandStorePostgres) Close(ctx context.Context) error {
+	if cs.appDb != nil {
+		_ = cs.appDb.Close()
+	}
 	return cs.db.Close()
 }
 func (cs *commandStorePostgres) Options() comby.CommandStoreOptions {

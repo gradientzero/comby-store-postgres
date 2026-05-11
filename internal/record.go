@@ -9,14 +9,15 @@ type Command struct {
 	ID sql.NullInt64
 
 	// fields
-	InstanceId int64  `json:"instance_id"`
-	Uuid       string `json:"uuid"`
-	TenantUuid string `json:"tenant_uuid"`
-	Domain     string `json:"domain"`
-	CreatedAt  int64  `json:"created_at"`
-	DataType   string `json:"data_type"`
-	DataBytes  string `json:"data_bytes"`
-	ReqCtx     string `json:"req_ctx"`
+	InstanceId    int64  `json:"instance_id"`
+	Uuid          string `json:"uuid"`
+	TenantUuid    string `json:"tenant_uuid"`
+	WorkspaceUuid string `json:"workspace_uuid"`
+	Domain        string `json:"domain"`
+	CreatedAt     int64  `json:"created_at"`
+	DataType      string `json:"data_type"`
+	DataBytes     string `json:"data_bytes"`
+	ReqCtx        string `json:"req_ctx"`
 }
 
 type Event struct {
@@ -27,6 +28,7 @@ type Event struct {
 	InstanceId    int64  `json:"instance_id"`
 	Uuid          string `json:"uuid"`
 	TenantUuid    string `json:"tenant_uuid"`
+	WorkspaceUuid string `json:"workspace_uuid"`
 	CommandUuid   string `json:"command_uuid"`
 	Domain        string `json:"domain"`
 	AggregateUuid string `json:"aggregate_uuid"`
