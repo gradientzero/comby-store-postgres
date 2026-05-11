@@ -219,8 +219,8 @@ func TestRLS_PerStoreInitIsScoped(t *testing.T) {
 
 	// events should have RLS, commands+snapshots should not even exist
 	for _, c := range []struct {
-		name       string
-		mustExist  bool
+		name        string
+		mustExist   bool
 		mustHaveRLS bool
 	}{
 		{"events", true, true},
@@ -709,4 +709,3 @@ func TestRLS_DisablePostgresRLS(t *testing.T) {
 		t.Fatalf("after DisableRLS expected 1 row visible to app role, got %d", nAfter)
 	}
 }
-

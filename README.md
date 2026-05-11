@@ -17,7 +17,7 @@ docker run --name some-postgres -p 5432:5432 -e POSTGRES_PASSWORD=mysecretpasswo
 
 ## Installation
 
-*comby-store-postgres* supports the latest version of comby (v2), requires Go version 1.22+ and is based on Postgres driver [lib/pq](https://github.com/lib/pq).
+*comby-store-postgres* supports the latest version of comby (v3), requires Go version 1.22+ and is based on Postgres driver [lib/pq](https://github.com/lib/pq).
 
 ```shell
 go get github.com/gradientzero/comby-store-postgres
@@ -28,7 +28,7 @@ go get github.com/gradientzero/comby-store-postgres
 ```go
 import (
 	"github.com/gradientzero/comby-store-postgres"
-	"github.com/gradientzero/comby/v2"
+	"github.com/gradientzero/comby/v3"
 )
 
 // create postgres CommandStore
