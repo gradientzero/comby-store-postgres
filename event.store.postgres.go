@@ -67,8 +67,9 @@ func (es *eventStorePostgres) connectAs(ctx context.Context, user, password stri
 	if len(password) != 0 {
 		passwordStr = fmt.Sprintf("password=%s", password)
 	}
-	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s sslmode=disable",
-		es.host, es.port, user, passwordStr, dbNameStr)
+	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s %s",
+		es.host, es.port, user, passwordStr, dbNameStr,
+		buildSSLParams(es.options.SSLMode, es.options.SSLRootCert, es.options.SSLCert, es.options.SSLKey))
 
 	// create postgres connection
 	db, err := sql.Open("postgres", dsn)

@@ -25,6 +25,15 @@ type snapshotStorePostgresConfig struct {
 	// EventStoreOptionWithRLSAppRole for the analogue on the event store.
 	RLSAppRoleUser     string
 	RLSAppRolePassword string
+
+	// Postgres TLS settings. Empty SSLMode keeps the historical "disable"
+	// default; see EventStoreOptions.SSLMode for the analogue on the event
+	// store. Certificate paths are passed through as sslrootcert/sslcert/
+	// sslkey and only emitted when set.
+	SSLMode     string
+	SSLRootCert string
+	SSLCert     string
+	SSLKey      string
 }
 
 // SnapshotStorePostgresWithMaxOpenConns sets the maximum number of open connections.
@@ -53,6 +62,24 @@ func SnapshotStorePostgresWithRLSAppRole(user, password string) SnapshotStorePos
 	return func(c *snapshotStorePostgresConfig) {
 		c.RLSAppRoleUser = user
 		c.RLSAppRolePassword = password
+	}
+}
+
+// SnapshotStorePostgresWithSSLMode sets the libpq sslmode (e.g. "disable",
+// "require", "verify-ca", "verify-full"). An empty value keeps the default
+// "disable".
+func SnapshotStorePostgresWithSSLMode(mode string) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) { c.SSLMode = mode }
+}
+
+// SnapshotStorePostgresWithSSLCert sets the TLS certificate file paths
+// (sslrootcert / sslcert / sslkey). Pass empty strings for the ones you do not
+// need. Typically combined with SnapshotStorePostgresWithSSLMode("verify-full").
+func SnapshotStorePostgresWithSSLCert(rootCert, cert, key string) SnapshotStorePostgresOption {
+	return func(c *snapshotStorePostgresConfig) {
+		c.SSLRootCert = rootCert
+		c.SSLCert = cert
+		c.SSLKey = key
 	}
 }
 
@@ -97,8 +124,9 @@ func (s *snapshotStorePostgres) connectAs(ctx context.Context, user, password st
 	if len(password) != 0 {
 		passwordStr = fmt.Sprintf("password=%s", password)
 	}
-	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s sslmode=disable",
-		s.host, s.port, user, passwordStr, dbNameStr)
+	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s %s",
+		s.host, s.port, user, passwordStr, dbNameStr,
+		buildSSLParams(s.config.SSLMode, s.config.SSLRootCert, s.config.SSLCert, s.config.SSLKey))
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {

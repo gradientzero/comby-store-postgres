@@ -59,8 +59,9 @@ func (cs *commandStorePostgres) connectAs(ctx context.Context, user, password st
 	if len(password) != 0 {
 		passwordStr = fmt.Sprintf("password=%s", password)
 	}
-	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s sslmode=disable",
-		cs.host, cs.port, user, passwordStr, dbNameStr)
+	dsn := fmt.Sprintf("host=%s port=%d user=%s %s %s %s",
+		cs.host, cs.port, user, passwordStr, dbNameStr,
+		buildSSLParams(cs.options.SSLMode, cs.options.SSLRootCert, cs.options.SSLCert, cs.options.SSLKey))
 
 	// create postgres connection
 	db, err := sql.Open("postgres", dsn)
