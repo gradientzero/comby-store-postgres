@@ -143,6 +143,49 @@ func (es *eventStorePostgres) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS "created_at_index" ON "events" (
 		"created_at" ASC
 	);
+
+	-- Composite indexes for the three query shapes the single-column indexes above
+	-- cannot serve. Every one of them was a sequential scan over the WHOLE table, so
+	-- their cost grew with total event volume rather than with the rows they return.
+	--
+	-- NOTE ON DEPLOYING THESE TO AN EXISTING DATABASE: CREATE INDEX here is NOT
+	-- CONCURRENTLY (migrate() also creates the table, and CONCURRENTLY cannot run in
+	-- a transaction or against a table being created). On a populated database this
+	-- takes an ACCESS EXCLUSIVE lock for the length of the build, which on a large
+	-- events table stalls every other connection — including a second instance that
+	-- is already serving. Build them CONCURRENTLY out-of-band FIRST; IF NOT EXISTS
+	-- then makes this a no-op at boot. On a fresh database it is instant either way.
+
+	-- (domain, aggregate_uuid): AggregateRepository.ListAggregates asks
+	-- UniqueList for "SELECT DISTINCT aggregate_uuid FROM events WHERE domain=$1"
+	-- plus its COUNT(DISTINCT ...) twin. api/account.LoginEmailPassword calls it on
+	-- EVERY login to resolve an account by email, so without this index an
+	-- email/password login seq-scans the entire event store — twice. Observed on a
+	-- 375k-row / 630 MB table: 66s and 76s, against a caller whose request context
+	-- gave up at 30s. Index-only scan with this in place.
+	CREATE INDEX IF NOT EXISTS "events_domain_aggregate_idx" ON "events" (
+		"domain" ASC, "aggregate_uuid" ASC
+	);
+
+	-- (aggregate_uuid, version): AggregateRepository.GetAggregate — the hottest read
+	-- in the framework, on the path of every command and once per aggregate in the
+	-- ListAggregates fan-out — is "WHERE aggregate_uuid=$1 ORDER BY version ASC".
+	-- aggregate_uuid_index serves the filter but leaves a Sort on top; this serves
+	-- both and supersedes it. The single-column index is left in place: dropping one
+	-- is a decision for the operator, not for a migration.
+	CREATE INDEX IF NOT EXISTS "events_aggregate_version_idx" ON "events" (
+		"aggregate_uuid" ASC, "version" ASC
+	);
+
+	-- (tenant_uuid, domain, created_at): List(WithTenantUuid + WithDomains +
+	-- OrderBy created_at), which is what an audit/event-trail read looks like. The
+	-- leading tenant column alone is no help wherever one tenant owns most of the
+	-- table — a single-tenant deployment, or a platform tenant holding the control
+	-- plane — and the trailing created_at supplies the ordering the query asks for,
+	-- so the sort disappears with it.
+	CREATE INDEX IF NOT EXISTS "events_tenant_domain_created_idx" ON "events" (
+		"tenant_uuid" ASC, "domain" ASC, "created_at" ASC
+	);
 	`
 	if _, err := es.db.ExecContext(ctx, query); err != nil {
 		return err
