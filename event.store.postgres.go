@@ -529,18 +529,26 @@ func (es *eventStorePostgres) List(ctx context.Context, opts ...comby.EventStore
 	var queryTotal int64
 	var dbRecords []*internal.Event
 	if rlsErr := es.withTenantConn(ctx, listOpts.TenantUuid, func(q pgQuerier) error {
-		// count
-		var row *sql.Row
-		if len(args) > 0 {
-			row = q.QueryRowContext(ctx, queryTotalQuery, args...)
-		} else {
-			row = q.QueryRowContext(ctx, queryTotalQuery)
-		}
-		if err := row.Err(); err != nil {
-			return err
-		}
-		if err := row.Scan(&queryTotal); err != nil {
-			return err
+		// count — unless the caller said it will not read the total. The count is
+		// a second query over the SAME predicate, so its cost follows how many
+		// rows MATCH rather than how many are returned: on a paged walk it is
+		// charged again for every page, and summed over the walk that is
+		// quadratic in the table while the useful work is linear. -1 is the
+		// agreed "not computed" value (comby EventStoreListOptionSkipTotal).
+		queryTotal = -1
+		if !listOpts.SkipTotal {
+			var row *sql.Row
+			if len(args) > 0 {
+				row = q.QueryRowContext(ctx, queryTotalQuery, args...)
+			} else {
+				row = q.QueryRowContext(ctx, queryTotalQuery)
+			}
+			if err := row.Err(); err != nil {
+				return err
+			}
+			if err := row.Scan(&queryTotal); err != nil {
+				return err
+			}
 		}
 
 		// list
